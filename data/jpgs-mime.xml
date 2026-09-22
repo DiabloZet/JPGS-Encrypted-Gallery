@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-jpgs">
+    <comment>Encrypted JPGS image</comment>
+    <comment xml:lang="ru">Зашифрованное изображение JPGS</comment>
+    <sub-class-of type="application/octet-stream"/>
+    <generic-icon name="image-x-generic"/>
+    <icon name="application-x-jpgs"/>
+    <glob pattern="*.jpgs"/>
+  </mime-type>
+  <mime-type type="application/x-vids">
+    <comment>Encrypted JPGS video</comment>
+    <comment xml:lang="ru">Зашифрованное видео JPGS</comment>
+    <sub-class-of type="application/octet-stream"/>
+    <generic-icon name="video-x-generic"/>
+    <icon name="application-x-vids"/>
+    <glob pattern="*.vids"/>
+  </mime-type>
+</mime-info>

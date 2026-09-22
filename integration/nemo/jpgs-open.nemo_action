@@ -1,0 +1,7 @@
+[Nemo Action]
+Name=Открыть в JPGS
+Comment=Открыть в JPGS
+Exec=@BIN@ %F
+Icon-Name=org.jpgs.JPGS
+Selection=notnone
+Extensions=jpgs;vids;

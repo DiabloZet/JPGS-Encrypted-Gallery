@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+scratch/
+pkg/
+src/
+*.pkg.tar.*
+# никогда не коммитить ключи и личные файлы
+key
+*.key
+*.jpgs
+*.vids
+!tests/**
