@@ -195,4 +195,4 @@ python3 -m unittest discover -s tests -v
 
 ## Лицензия
 
-[MIT](LICENSE) © DiabloZet
+[GPL-3.0 license](LICENSE) © DiabloZet
