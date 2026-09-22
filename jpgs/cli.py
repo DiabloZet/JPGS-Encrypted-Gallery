@@ -20,10 +20,11 @@ import sys
 
 from . import __version__
 from . import container as C
-from .crypto import Cipher, KeyMissing, fingerprint, generate_key, key_file, save_key
+from .crypto import (Cipher, KeyLocked, KeyMissing, fingerprint_material, generate_key,
+                     material_for)
 
 COMMANDS = ("?", "encryptor", "merge", "decoder", "recovery", "encrypt", "decrypt", "info",
-            "thumbnail", "set-key", "key")
+            "thumbnail", "set-key", "key", "keys")
 
 HELP = ("Command:\n"
         "1. encryptor - Encrypt file to jpg format.\n"
@@ -32,8 +33,34 @@ HELP = ("Command:\n"
         "4. recovery - Recovering possible data from a damaged file.\n"
         "Extra: encrypt FILES [-o DIR] [--remove], decrypt FILES [-o DIR], info FILES\n"
         "Videos: encryptor/encrypt produce .vids, decoder/decrypt restore the original video\n"
-        "Key: jpgs set-key [--generate | --stdin]  |  jpgs key  (fingerprint)\n"
-        "     stored in ~/.config/jpgs/key (mode 600) or env JPGS_KEY")
+        "Key: jpgs set-key [--generate | --stdin | --legacy]  |  jpgs key  (fingerprint)\n"
+        "Keys: jpgs keys [list | add | remove | use | rename | passwd | upgrade | rekey]\n"
+        "      ~/.config/jpgs/keystore.json; env JPGS_WORD (усиленный) / JPGS_KEY (старый формат)\n"
+        "      / JPGS_PASSWORD")
+
+
+def _ensure_unlocked() -> bool:
+    """Если хранилище защищено паролем — спросить пароль (или взять из JPGS_PASSWORD).
+
+    Возвращает False, если разблокировать не удалось (тогда команда должна прерваться).
+    """
+    from .keystore import get_keystore
+    ks = get_keystore()
+    if not ks.is_locked():
+        return True
+    env = os.environ.get("JPGS_PASSWORD")
+    if env and ks.unlock(env):
+        return True
+    if not sys.stdin.isatty():
+        why = "неверный пароль в JPGS_PASSWORD" if env else "задайте JPGS_PASSWORD"
+        print(f"Хранилище ключей защищено паролем ({why}).", file=sys.stderr)
+        return False
+    import getpass
+    for _ in range(3):
+        if ks.unlock(getpass.getpass("Пароль JPGS: ")):
+            return True
+        print("Неверный пароль.", file=sys.stderr)
+    return False
 
 
 def main(argv: list[str]) -> int:
@@ -46,14 +73,23 @@ def main(argv: list[str]) -> int:
     cmd, rest = argv[0], argv[1:]
     if cmd == "set-key":
         return set_key(rest)
+    if cmd == "keys":
+        return keys_cmd(rest)
     try:
         if cmd == "key":
-            from .crypto import configured_key
-            print(f"Ключ задан, отпечаток: {fingerprint(configured_key())}")
+            from .crypto import configured_material
+            if not _ensure_unlocked():
+                return 1
+            print(f"Ключ задан, отпечаток: {fingerprint_material(configured_material())}")
             return 0
         if cmd == "thumbnail":
             return thumbnail(rest)
+        if not _ensure_unlocked():
+            return 1
         return _main(cmd, rest)
+    except KeyLocked as e:
+        print(e, file=sys.stderr)
+        return 2
     except KeyMissing as e:
         print(e, file=sys.stderr)
         return 2
@@ -61,20 +97,18 @@ def main(argv: list[str]) -> int:
 
 def set_key(rest: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="jpgs set-key",
-                                 description="Задать ключ шифрования (хранится в ~/.config/jpgs/key)")
+                                 description="Добавить ключ шифрования и сделать его активным")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--generate", action="store_true", help="создать случайный ключ")
     g.add_argument("--stdin", action="store_true", help="прочитать ключ из stdin (для скриптов)")
-    ap.add_argument("--force", action="store_true", help="перезаписать существующий ключ без вопроса")
+    ap.add_argument("--name", help="имя ключа в списке (по умолчанию «Ключ»)")
+    ap.add_argument("--legacy", action="store_true",
+                    help="ключ старого формата (для файлов, созданных прежними версиями)")
+    ap.add_argument("--force", action="store_true", help="без подтверждения (совместимость)")
     a = ap.parse_args(rest)
-    if os.path.exists(key_file()) and not a.force:
-        if not sys.stdin.isatty():
-            print(f"Ключ уже задан ({key_file()}). Используйте --force.", file=sys.stderr)
-            return 1
-        ans = input("Ключ уже задан. Файлы, зашифрованные старым ключом, с новым не откроются.\n"
-                    "Заменить? [y/N] ").strip().lower()
-        if ans not in ("y", "yes", "д", "да"):
-            return 1
+    from .keystore import get_keystore
+    if not _ensure_unlocked():
+        return 1
     if a.generate:
         key = generate_key()
     elif a.stdin:
@@ -88,12 +122,187 @@ def set_key(rest: list[str]) -> int:
     if not key:
         print("Пустой ключ.", file=sys.stderr)
         return 1
-    if len(key.encode()) < 16:
+    kind = "raw" if a.legacy else "derived"
+    if len(key.encode()) < 16 and kind == "raw":
         print("⚠ Ключ короче 16 символов — его легко подобрать.", file=sys.stderr)
-    path = save_key(key)
-    print(f"Ключ сохранён в {path} (доступ только для вас). Отпечаток: {fingerprint(key)}")
+    ks = get_keystore()
+    ks.add(a.name or "Ключ", key, activate=True, kind=kind)
+    what = "старого формата" if kind == "raw" else "усиленный"
+    print(f"Ключ добавлен и активен ({what}). Отпечаток: {fingerprint_material(material_for(key, kind))}")
     if a.generate:
         print(f"Сгенерированный ключ: {key}\nСохраните его в надёжном месте — без него файлы не открыть.")
+    return 0
+
+
+def _rekey_files(paths: list[str], old: Cipher, new: Cipher, to_id: str) -> int:
+    """Перешифровать файлы со старого ключа на новый. Файлы, не читаемые старым, пропускаем."""
+    rc = 0
+    for p in paths:
+        try:
+            if not C.verify_media(p, old):
+                print(f"{p}: пропущен — не расшифровывается исходным ключом", file=sys.stderr)
+                rc = 1
+                continue
+            C.reencrypt_media(p, old, new)
+            print(f"{p}: перешифрован ключом {to_id}")
+        except Exception as e:  # noqa: BLE001
+            print(f"{p}: не удалось — {e}", file=sys.stderr)
+            rc = 1
+    return rc
+
+
+def keys_cmd(rest: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="jpgs keys", description="Управление ключами шифрования")
+    sub = ap.add_subparsers(dest="sub")
+    sub.add_parser("list", help="показать ключи")
+    p_add = sub.add_parser("add", help="добавить ключ")
+    p_add.add_argument("--name", help="имя ключа")
+    g = p_add.add_mutually_exclusive_group()
+    g.add_argument("--generate", action="store_true", help="случайный ключ")
+    g.add_argument("--stdin", action="store_true", help="ключ из stdin")
+    p_add.add_argument("--legacy", action="store_true",
+                       help="ключ старого формата (для файлов из прежних версий)")
+    p_add.add_argument("--activate", action="store_true", help="сразу сделать активным")
+    p_rm = sub.add_parser("remove", help="удалить ключ")
+    p_rm.add_argument("id", help="id ключа (см. keys list)")
+    p_use = sub.add_parser("use", help="сделать ключ активным")
+    p_use.add_argument("id")
+    p_ren = sub.add_parser("rename", help="переименовать ключ")
+    p_ren.add_argument("id")
+    p_ren.add_argument("name")
+    p_pw = sub.add_parser("passwd", help="задать/сменить/снять пароль на программу")
+    p_pw.add_argument("--remove", action="store_true", help="снять пароль")
+    p_up = sub.add_parser("upgrade", help="усилить ключ старого формата (то же слово через PBKDF2)")
+    p_up.add_argument("id", help="id ключа старого формата")
+    p_up.add_argument("--name", help="имя нового ключа")
+    p_up.add_argument("--rekey", nargs="+", metavar="ФАЙЛ",
+                      help="сразу перешифровать эти файлы новым ключом")
+    p_up.add_argument("--activate", action="store_true",
+                      help="сделать усиленный ключ активным (обычно вместе с --rekey)")
+    p_rk = sub.add_parser("rekey", help="перешифровать файлы другим ключом")
+    p_rk.add_argument("files", nargs="+")
+    p_rk.add_argument("--to", required=True, help="id ключа назначения (см. keys list)")
+    a = ap.parse_args(rest)
+    from .keystore import get_keystore
+    ks = get_keystore()
+
+    if a.sub in (None, "list"):
+        if not _ensure_unlocked():
+            return 1
+        if not ks.exists() or ks.count() == 0:
+            print("Ключей нет. Добавьте: jpgs set-key")
+            return 0
+        lock = " (пароль установлен)" if ks.is_encrypted() else ""
+        print(f"Ключи{lock}:")
+        has_raw = False
+        for e in ks.entries():
+            mark = "*" if e["active"] else " "
+            kind = "старый формат" if e["kind"] == "raw" else "усиленный"
+            has_raw = has_raw or e["kind"] == "raw"
+            weak = "  ⚠ короткий" if e["weak"] else ""
+            print(f" {mark} {e['id']}  {e['fingerprint']}  {e['name']}  [{kind}]{weak}")
+        print("(* — активный)")
+        if has_raw:
+            print("Усилить старый ключ: jpgs keys upgrade <id> --rekey ФАЙЛЫ --activate")
+        return 0
+
+    if not _ensure_unlocked():
+        return 1
+
+    if a.sub == "add":
+        if a.generate:
+            key = generate_key()
+        elif a.stdin:
+            key = sys.stdin.readline().strip("\r\n")
+        else:
+            import getpass
+            key = getpass.getpass("Ключ: ")
+            if getpass.getpass("Повторите: ") != key:
+                print("Ключи не совпадают.", file=sys.stderr)
+                return 1
+        if not key:
+            print("Пустой ключ.", file=sys.stderr)
+            return 1
+        kind = "raw" if a.legacy else "derived"
+        kid = ks.add(a.name or "Ключ", key, activate=a.activate, kind=kind)
+        what = "старого формата" if kind == "raw" else "усиленный"
+        print(f"Добавлен ключ {kid} ({what}) · отпечаток "
+              f"{fingerprint_material(material_for(key, kind))}"
+              + (" (активен)" if a.activate else ""))
+        if a.generate:
+            print(f"Сгенерированный ключ: {key}\nСохраните его — без него файлы не открыть.")
+        return 0
+
+    known = {e["id"] for e in ks.entries()}
+    if a.sub in ("remove", "use", "rename") and a.id not in known:
+        print(f"Нет ключа с id {a.id} (см. jpgs keys list).", file=sys.stderr)
+        return 1
+
+    if a.sub == "remove":
+        ks.remove(a.id)
+        print(f"Ключ {a.id} удалён.")
+        return 0
+
+    if a.sub == "use":
+        ks.set_active(a.id)
+        print(f"Активный ключ: {a.id}")
+        return 0
+
+    if a.sub == "rename":
+        ks.rename(a.id, a.name)
+        print(f"Ключ {a.id} переименован в «{a.name}».")
+        return 0
+
+    if a.sub == "passwd":
+        if a.remove:
+            ks.set_password(None)
+            print("Пароль снят. Ключи снова хранятся без пароля.")
+            return 0
+        import getpass
+        pw = getpass.getpass("Новый пароль: ")
+        if pw != getpass.getpass("Повторите пароль: "):
+            print("Пароли не совпадают.", file=sys.stderr)
+            return 1
+        if not pw:
+            print("Пустой пароль. Чтобы снять пароль: jpgs keys passwd --remove", file=sys.stderr)
+            return 1
+        ks.set_password(pw)
+        print("Пароль установлен. Список ключей теперь хранится зашифрованным.")
+        return 0
+
+    if a.sub == "upgrade":
+        try:
+            new_id = ks.upgrade(a.id, a.name, activate=a.activate and not a.rekey)
+        except KeyError:
+            print(f"Нет ключа с id {a.id} (см. jpgs keys list).", file=sys.stderr)
+            return 1
+        except ValueError as e:
+            print(f"{e}", file=sys.stderr)
+            return 1
+        mat = ks.material_by_id(new_id)
+        print(f"Создан усиленный ключ {new_id} · отпечаток {fingerprint_material(mat)}")
+        rc = 0
+        if a.rekey:
+            old = Cipher(material=ks.material_by_id(a.id))
+            new = Cipher(material=mat)
+            rc = _rekey_files(a.rekey, old, new, new_id)
+            if a.activate:
+                ks.set_active(new_id)
+                print(f"Активный ключ: {new_id}")
+        else:
+            print("Файлы пока зашифрованы старым ключом. Перешифровать:\n"
+                  f"  jpgs keys rekey ФАЙЛЫ --to {new_id}")
+        return rc
+
+    if a.sub == "rekey":
+        try:
+            new = Cipher(material=ks.material_by_id(a.to))
+        except KeyError:
+            print(f"Нет ключа с id {a.to} (см. jpgs keys list).", file=sys.stderr)
+            return 1
+        return _rekey_files(a.files, Cipher(), new, a.to)
+
+    ap.print_help()
     return 0
 
 

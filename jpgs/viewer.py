@@ -29,7 +29,8 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk  # no
 
 from . import APP_ID, __version__  # noqa: E402
 from . import container as C  # noqa: E402
-from .crypto import Cipher, KeyMissing, configured_key, fingerprint, generate_key, save_key  # noqa: E402
+from . import keys_ui  # noqa: E402
+from .crypto import Cipher, KeyMissing  # noqa: E402
 from .imaging import DecodeError, decode  # noqa: E402
 from .memory import trim as trim_memory  # noqa: E402
 from .video_ui import VideoPane, fmt_time  # noqa: E402
@@ -461,9 +462,10 @@ class JpgsWindow(Adw.ApplicationWindow):
         s3.append("Зашифровать изображения и видео…", "win.encrypt")
         s3.append("Объединить .jpgs в один файл…", "win.merge")
         s3.append("Расшифровать все файлы папки…", "win.decrypt-folder")
+        s3.append("Сменить ключ у всех файлов папки…", "win.rekey-folder")
         menu.append_section(None, s3)
         s4 = Gio.Menu()
-        s4.append("Ключ шифрования…", "app.key")
+        s4.append("Ключи шифрования…", "app.key")
         s4.append("Горячие клавиши", "win.shortcuts")
         s4.append("О программе", "app.about")
         menu.append_section(None, s4)
@@ -554,6 +556,13 @@ class JpgsWindow(Adw.ApplicationWindow):
                                   css_classes=["filmstrip"], single_click_activate=False)
         sc = Gtk.ScrolledWindow(child=self.strip, vscrollbar_policy=Gtk.PolicyType.NEVER,
                                 hscrollbar_policy=Gtk.PolicyType.AUTOMATIC, min_content_height=96)
+        self.strip_sw = sc
+        # колёсико мыши (вертикальное) прокручивает горизонтальную ленту
+        strip_scroll = Gtk.EventControllerScroll(
+            flags=Gtk.EventControllerScrollFlags.BOTH_AXES)
+        strip_scroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        strip_scroll.connect("scroll", self._strip_scroll)
+        sc.add_controller(strip_scroll)
         self.strip_revealer = Gtk.Revealer(child=sc, reveal_child=False,
                                            transition_type=Gtk.RevealerTransitionType.SLIDE_UP)
         self.tv.add_bottom_bar(self.strip_revealer)
@@ -596,6 +605,7 @@ class JpgsWindow(Adw.ApplicationWindow):
         add("archive-add", self.archive_add_dialog)
         add("frame-left", lambda: self.frame_move(-1))
         add("frame-right", lambda: self.frame_move(1))
+        add("frame-goto", self.frame_goto)
         add("frame-delete", self.frame_delete)
         add("frame-extract", self.frame_extract)
         add("archive-split", self.archive_split)
@@ -603,6 +613,8 @@ class JpgsWindow(Adw.ApplicationWindow):
         add("show-in-folder", self.show_in_folder)
         add("properties", self.properties_dialog)
         add("video-frame", self.save_video_frame)
+        add("rekey-file", self.rekey_current)
+        add("rekey-folder", self.rekey_folder)
         sp = Gio.SimpleAction.new_stateful("speed", GLib.VariantType.new("s"), GLib.Variant("s", "1"))
 
         def set_speed(a, v):
@@ -671,10 +683,13 @@ class JpgsWindow(Adw.ApplicationWindow):
         self._enable("archive-add", arch and self.cipher is not None)
         self._enable("frame-left", arch and n > 1 and self.ii > 0)
         self._enable("frame-right", arch and n > 1 and 0 <= self.ii < n - 1)
+        self._enable("frame-goto", arch and n > 1)
         for a in ("frame-delete", "frame-extract", "archive-split"):
             self._enable(a, arch and n > 1)
         for a in ("rename", "show-in-folder", "properties"):
             self._enable(a, has)
+        self._enable("rekey-file", has)
+        self._enable("rekey-folder", has)
         self._enable("video-frame", is_video)
         self._enable("speed", is_video)
         self.zoom_btn.set_sensitive(shown)
@@ -919,6 +934,43 @@ class JpgsWindow(Adw.ApplicationWindow):
         order[i], order[j] = order[j], order[i]
         self._frames_op("Перемещение кадра…", lambda: C.rewrite_frames(jf.path, order, self.cipher), j)
 
+    def frame_goto(self):
+        """Переместить текущий кадр на введённый номер (1..n); остальные сдвигаются."""
+        jf = self._cur_archive()
+        n = self.counts.get(self.fi, 1)
+        if jf is None or n < 2:
+            return
+        cur = self.ii + 1
+        adj = Gtk.Adjustment(value=cur, lower=1, upper=n, step_increment=1, page_increment=1)
+        spin = Gtk.SpinButton(adjustment=adj, numeric=True, digits=0)
+        spin.set_hexpand(True)
+        d = Adw.AlertDialog(heading=f"Переместить кадр {cur} из {n}",
+                            body=f"Введите новый номер кадра (1–{n}). Остальные кадры сдвинутся.")
+        d.set_extra_child(spin)
+        d.add_response("cancel", "Отмена")
+        d.add_response("ok", "Переместить")
+        d.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+        d.set_default_response("ok")
+        d.set_close_response("cancel")
+
+        def resp(_d, r):
+            if r != "ok":
+                return
+            spin.update()  # применить набранное вручную значение
+            target = int(spin.get_value_as_int()) - 1
+            target = max(0, min(n - 1, target))
+            i = self.ii
+            if target == i:
+                return
+            order = list(range(n))
+            f = order.pop(i)
+            order.insert(target, f)
+            self._frames_op("Перемещение кадра…",
+                            lambda: C.rewrite_frames(jf.path, order, self.cipher), target)
+        d.connect("response", resp)
+        d.present(self)
+        _focus_later(spin, select_all=True)
+
     def frame_delete(self):
         jf = self._cur_archive()
         n = self.counts.get(self.fi, 1)
@@ -1016,7 +1068,7 @@ class JpgsWindow(Adw.ApplicationWindow):
             self._reload_folder(dest, ii)
         d.connect("response", resp)
         d.present(self)
-        GLib.idle_add(lambda: entry.grab_focus() or False)
+        _focus_later(entry, select_all=True)
 
     def show_in_folder(self):
         if not self.files:
@@ -1074,9 +1126,135 @@ class JpgsWindow(Adw.ApplicationWindow):
                 dest = d.save_finish(res).get_path()
             except GLib.Error:
                 return
-            r = self.video.player.command("screenshot-to-file", dest, "video")
-            self.toast("Кадр сохранён" if r >= 0 else "Не удалось сохранить кадр")
+            if not dest.lower().endswith(".png"):
+                dest += ".png"
+            self._do_save_video_frame(jf.path, t, dest)
         dlg.save(self, None, picked)
+
+    def _do_save_video_frame(self, path, t, dest):
+        """Декодируем кадр через PyAV (надёжно при hwdec); если PyAV нет — screenshot mpv."""
+        def work():
+            from .video import save_frame_png
+            save_frame_png(path, self.cipher, t, dest)
+            return dest
+
+        def done(p):
+            self.toast(f"Кадр сохранён: {os.path.basename(p)}")
+
+        def fallback():
+            player = self.video.player
+            r = player.command("screenshot-to-file", dest, "video") if player else -1
+            self.toast(f"Кадр сохранён: {os.path.basename(dest)}" if r is not None and r >= 0
+                       else "Не удалось сохранить кадр")
+
+        try:
+            import av  # noqa: F401
+        except ImportError:
+            fallback()
+            return
+        self.run_bg("Сохранение кадра…", work, done)
+
+    # ---------------------------------------------------------------- смена ключа файлов
+
+    def rekey_current(self):
+        if not self.files:
+            return
+        jf = self.files[self.fi]
+        fi, ii = self.fi, self.ii
+
+        def choose(kid):
+            from .keystore import get_keystore
+            try:
+                new = Cipher(material=get_keystore().material_by_id(kid))
+            except (KeyError, KeyMissing):
+                self.toast("Ключ не найден")
+                return
+            old = self.cipher
+            self.run_bg(
+                "Смена ключа…",
+                lambda: (C.reencrypt_media(jf.path, old, new,
+                                           self._progress_toast() if jf.is_video else None), kid)[1],
+                lambda k: self._after_rekey(k, jf.path, fi, ii))
+        keys_ui.choose_key_dialog(
+            self.app, self, "Сменить ключ файла",
+            f"Выберите ключ, которым перешифровать «{jf.name}».", choose, exclude_active=True)
+
+    def rekey_folder(self):
+        if not self.files or not self.folder:
+            return
+        keys_ui.choose_key_dialog(
+            self.app, self, "Сменить ключ у всех файлов папки",
+            f"Файлы в «{os.path.basename(self.folder)}» будут перешифрованы выбранным ключом. "
+            "Файлы, зашифрованные другим ключом, пропускаются.",
+            self.rekey_folder_to, exclude_active=True)
+
+    def rekey_folder_to(self, kid):
+        """Перешифровать все файлы текущей папки ключом kid (без диалога выбора)."""
+        if not self.files or not self.folder:
+            return
+        paths = [f.path for f in self.files]
+
+        def run():
+            from .keystore import get_keystore
+            try:
+                new = Cipher(material=get_keystore().material_by_id(kid))
+            except (KeyError, KeyMissing):
+                self.toast("Ключ не найден")
+                return
+            old = self.cipher
+
+            def work():
+                ok, skipped = 0, 0
+                for p in paths:
+                    if not C.verify_media(p, old):
+                        skipped += 1
+                        continue
+                    try:
+                        C.reencrypt_media(p, old, new)
+                        ok += 1
+                    except Exception:  # noqa: BLE001
+                        skipped += 1
+                return kid, ok, skipped
+
+            def done(res):
+                k, ok, skipped = res
+                msg = f"Перешифровано файлов: {ok}"
+                if skipped:
+                    msg += f", пропущено (другой ключ): {skipped}"
+                self.toast(msg)
+                cur = self.files[self.fi].path if self.files else None
+                self._after_rekey(k, cur, self.fi, self.ii, reload_only=(ok == 0))
+            self.run_bg("Смена ключа у файлов…", work, done)
+        run()
+
+    def _after_rekey(self, kid, reload_path, fi, ii, reload_only=False):
+        from .keystore import get_keystore
+        ks = get_keystore()
+        if reload_only or ks.active_id() == kid:
+            self._file_changed(fi, ii)
+            return
+        name = next((e["name"] for e in ks.entries() if e["id"] == kid), "новым ключом")
+        d = Adw.AlertDialog(
+            heading="Сделать этот ключ активным?",
+            body=f"Файлы перешифрованы ключом «{name}». Чтобы открывать их, сделайте его активным.")
+        d.add_response("later", "Позже")
+        d.add_response("switch", "Сделать активным")
+        d.set_response_appearance("switch", Adw.ResponseAppearance.SUGGESTED)
+        d.set_default_response("switch")
+        d.set_close_response("later")
+
+        def resp(_d, r):
+            if r != "switch":
+                return
+            ks.set_active(kid)
+            try:
+                self.app.cipher = Cipher()
+            except Exception:  # noqa: BLE001
+                pass
+            if reload_path:
+                self.open_path(reload_path)
+        d.connect("response", resp)
+        d.present(self)
 
     # ---------------------------------------------------------------- контекстное меню
 
@@ -1124,8 +1302,7 @@ class JpgsWindow(Adw.ApplicationWindow):
             a = Gio.Menu()
             a.append("Добавить изображения в этот файл…", "win.archive-add")
             if n > 1:
-                a.append("Сдвинуть кадр влево", "win.frame-left")
-                a.append("Сдвинуть кадр вправо", "win.frame-right")
+                a.append("Переместить кадр на номер…", "win.frame-goto")
                 a.append("Вынести кадр в отдельный файл", "win.frame-extract")
                 a.append("Удалить кадр из файла", "win.frame-delete")
                 a.append("Разделить на отдельные файлы", "win.archive-split")
@@ -1133,6 +1310,7 @@ class JpgsWindow(Adw.ApplicationWindow):
             menu.append_section(title, a)
         f = Gio.Menu()
         f.append("Переименовать…", "win.rename")
+        f.append("Сменить ключ файла…", "win.rekey-file")
         f.append("Показать в папке", "win.show-in-folder")
         f.append("Свойства", "win.properties")
         f.append("Переместить в корзину", "win.trash")
@@ -1551,6 +1729,15 @@ class JpgsWindow(Adw.ApplicationWindow):
         self._syncing = False
         if self.strip_revealer.get_reveal_child():
             self.strip.scroll_to(self.fi, Gtk.ListScrollFlags.NONE, None)
+
+    def _strip_scroll(self, ctl, dx, dy):
+        adj = self.strip_sw.get_hadjustment()
+        delta = dy if abs(dy) >= abs(dx) else dx
+        if not delta:
+            return False
+        step = adj.get_step_increment() or 48
+        adj.set_value(adj.get_value() + delta * step * 2)
+        return True
 
     def _on_strip_selected(self, sel, _p):
         if self._syncing:
@@ -1981,7 +2168,7 @@ class JpgsApp(Adw.Application):
         Gtk.Window.set_default_icon_name(APP_ID)
 
         keyact = Gio.SimpleAction.new("key", None)
-        keyact.connect("activate", lambda *_: self.key_dialog(self.get_active_window()))
+        keyact.connect("activate", lambda *_: self.key_manager(self.get_active_window()))
         self.add_action(keyact)
         about = Gio.SimpleAction.new("about", None)
         about.connect("activate", self._about)
@@ -2028,6 +2215,10 @@ class JpgsApp(Adw.Application):
     def do_activate(self):
         win = self.get_active_window() or JpgsWindow(self)
         win.present()
+        from .keystore import get_keystore
+        if get_keystore().is_locked():
+            GLib.idle_add(lambda: keys_ui.unlock_dialog(self, win, None) and False)
+            return
         if self.encrypt:
             paths, self.encrypt = self.encrypt, []
             GLib.idle_add(lambda: win._confirm_encrypt(paths) and False)
@@ -2037,86 +2228,24 @@ class JpgsApp(Adw.Application):
     # ------------------------------------------------------------------ ключ
 
     def require_key(self, win, then: Callable[[], None]):
-        """Выполнить then(), когда ключ задан; если не задан — сначала спросить."""
+        """Выполнить then(), когда ключ доступен; иначе спросить пароль либо добавить ключ."""
         if self.cipher is not None:
             then()
             return
-        self.key_dialog(win, then)
-
-    def key_dialog(self, win, then: Optional[Callable[[], None]] = None):
-        try:
-            current = configured_key()
-        except KeyMissing:
-            current = None
-        if current:
-            body = (f"Текущий ключ задан, отпечаток: {fingerprint(current)}.\n"
-                    "Если заменить ключ, файлы, зашифрованные старым, перестанут открываться.")
+        from .keystore import get_keystore
+        ks = get_keystore()
+        if ks.is_locked():
+            keys_ui.unlock_dialog(self, win, then)
         else:
-            body = ("Ключ нужен, чтобы шифровать и открывать файлы. Он хранится только у вас "
-                    "(~/.config/jpgs/key). Если у вас уже есть зашифрованные файлы — введите тот же ключ, "
-                    "которым они созданы.")
-        d = Adw.AlertDialog(heading="Ключ шифрования", body=body)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
-        e1 = Adw.PasswordEntryRow(title="Ключ")
-        e2 = Adw.PasswordEntryRow(title="Повторите ключ")
-        lst.append(e1)
-        lst.append(e2)
-        box.append(lst)
-        gen = Gtk.Button(label="Сгенерировать случайный ключ", css_classes=["pill"],
-                         halign=Gtk.Align.CENTER)
-        info = Gtk.Label(wrap=True, selectable=True, css_classes=["caption"], xalign=0.5)
-        box.append(gen)
-        box.append(info)
-        d.set_extra_child(box)
-        d.add_response("cancel", "Отмена")
-        d.add_response("save", "Сохранить")
-        d.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
-        d.set_default_response("save")
-        d.set_close_response("cancel")
-        d.set_response_enabled("save", False)
+            keys_ui.add_key_dialog(self, win, then)
 
-        def changed(*_):
-            k1, k2 = e1.get_text(), e2.get_text()
-            ok = bool(k1) and k1 == k2
-            d.set_response_enabled("save", ok)
-            if ok:
-                warn = "  ⚠ короче 16 символов — ненадёжно" if len(k1.encode()) < 16 else ""
-                if not info.get_text().startswith("Сгенерирован"):
-                    info.set_text(f"Отпечаток: {fingerprint(k1)}{warn}")
-            elif k1 and k2:
-                info.set_text("Ключи не совпадают")
-            else:
-                info.set_text("")
-        e1.connect("changed", changed)
-        e2.connect("changed", changed)
-
-        def do_gen(_b):
-            k = generate_key()
-            info.set_text(f"Сгенерирован ключ (сохраните его, без него файлы не открыть):\n{k}\n"
-                          f"Отпечаток: {fingerprint(k)}")
-            e1.set_text(k)
-            e2.set_text(k)
-        gen.connect("clicked", do_gen)
-
-        def resp(_d, r):
-            if r != "save":
-                return
-            key = e1.get_text()
-            try:
-                save_key(key)
-                self.cipher = Cipher(key)
-            except (OSError, ValueError) as ex:
-                win.toast(f"Не удалось сохранить ключ: {ex}")
-                return
-            win.toast(f"Ключ сохранён · отпечаток {fingerprint(key)}")
-            for w in self.get_windows():
-                if isinstance(w, JpgsWindow) and w.files:
-                    w.open_path(w.files[w.fi].path)
-            if then:
-                then()
-        d.connect("response", resp)
-        d.present(win)
+    def key_manager(self, win):
+        """Меню → Ключи шифрования…"""
+        from .keystore import get_keystore
+        if get_keystore().is_locked():
+            keys_ui.unlock_dialog(self, win, lambda: keys_ui.KeyManager(self, win).present())
+        else:
+            keys_ui.KeyManager(self, win).present()
 
     def do_open(self, files, n, hint):
         for f in files:
@@ -2135,6 +2264,21 @@ class JpgsApp(Adw.Application):
                             comments="Просмотр зашифрованных изображений .jpgs и видео .vids (libmpv / FFmpeg). "
                                      "Расшифровка только в памяти — на диск ничего не пишется.")
         d.present(self.get_active_window())
+
+
+def _focus_later(widget, select_all: bool = False):
+    """Один раз перевести фокус после показа диалога.
+
+    Колбэк обязан вернуть False: grab_focus() возвращает True, и если вернуть его из idle,
+    источник не снимется — фокус будет отбираться обратно при каждом простое, а повторное
+    выделение текста не даст набрать больше одного символа.
+    """
+    def once():
+        widget.grab_focus()
+        if select_all:
+            widget.select_region(0, -1)
+        return False
+    GLib.idle_add(once)
 
 
 def human_size(n: int) -> str:

@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Service
+MimeType=application/x-jpgs;application/x-vids;
+Actions=open;decrypt;
+X-KDE-Priority=TopLevel
+
+[Desktop Action open]
+Name=Open in JPGS
+Name[ru]=Открыть в JPGS
+Icon=org.jpgs.JPGS
+Exec=/usr/bin/jpgs %F
+
+[Desktop Action decrypt]
+Name=Decrypt here
+Name[ru]=Расшифровать сюда
+Icon=document-decrypt
+Exec=/usr/bin/jpgs decrypt %F

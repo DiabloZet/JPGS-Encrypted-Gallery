@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=JPGS
+GenericName=Encrypted Image Viewer
+GenericName[ru]=Просмотр зашифрованных изображений
+Comment=View encrypted .jpgs images and .vids videos
+Comment[ru]=Просмотр зашифрованных изображений .jpgs и видео .vids
+Exec=/usr/bin/jpgs %F
+Icon=org.jpgs.JPGS
+Terminal=false
+StartupNotify=true
+StartupWMClass=org.jpgs.JPGS
+Categories=Graphics;Viewer;Utility;
+MimeType=application/x-jpgs;application/x-vids;
+Keywords=jpgs;vids;image;video;viewer;encrypted;photo;

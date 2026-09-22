@@ -16,11 +16,28 @@ import json
 import os
 
 BLOCK = 16
-KEY_ENV = "JPGS_KEY"
+KEY_ENV = "JPGS_KEY"        # ключ старого формата (байты строки как есть)
+WORD_ENV = "JPGS_WORD"      # слово нового формата (усиливается PBKDF2)
+
+# Усиление ключа: слово → 32 байта через PBKDF2-HMAC-SHA256.
+# Соль намеренно фиксированная, а не случайная: одно и то же слово должно давать один и тот
+# же ключ на любом компьютере — иначе потеря файла keystore.json означала бы потерю файлов,
+# даже если слово помнишь. Стойкость даёт не соль, а цена одной попытки перебора: вместо
+# одного блока AES злоумышленнику нужно KDF_ITERS итераций HMAC на каждого кандидата.
+KDF_SALT = b"jpgs-kdf-v1"
+KDF_ITERS = 300_000
 
 
 class KeyMissing(Exception):
     """Ключ шифрования не задан (см. `jpgs set-key`)."""
+
+
+class KeyLocked(KeyMissing):
+    """Хранилище ключей защищено паролем и ещё не разблокировано.
+
+    Наследует KeyMissing, чтобы старый код (`except KeyMissing`) продолжал работать,
+    но интерфейс может отличить «нет ключа» от «нужен пароль» и спросить пароль.
+    """
 
 
 def config_dir() -> str:
@@ -32,26 +49,44 @@ def key_file() -> str:
 
 
 def key_bytes(key: str) -> bytes:
-    """Как в исходной Java-версии: байты строки, обрезанные/дополненные нулями до 32."""
+    """Старый формат (как в Java-версии): байты строки, обрезанные/дополненные нулями до 32.
+
+    Слабое место: слово становится ключом напрямую, поэтому кандидат при переборе проверяется
+    одним блоком AES. Оставлено ради файлов, зашифрованных прежними версиями. Для новых
+    ключей — derive_material().
+    """
     raw = key.encode("utf-8")[:32]
     return raw + b"\0" * (32 - len(raw))
 
 
-def fingerprint(key: str) -> str:
-    """Короткий отпечаток ключа — сверить, что на двух компьютерах ключ одинаковый."""
+def derive_material(word: str, iters: int = KDF_ITERS) -> bytes:
+    """Новый формат: слово любой длины → полноценные 32 байта ключа AES-256."""
     import hashlib
-    h = hashlib.sha256(b"jpgs-key-fingerprint:" + key_bytes(key)).hexdigest()
+    return hashlib.pbkdf2_hmac("sha256", word.encode("utf-8"), KDF_SALT, iters, 32)
+
+
+def material_for(key: str, kind: str = "derived") -> bytes:
+    """Байты ключа по слову и типу записи: 'raw' — старый формат, 'derived' — усиленный."""
+    return key_bytes(key) if kind == "raw" else derive_material(key)
+
+
+def fingerprint_material(material: bytes) -> str:
+    """Отпечаток по готовым байтам ключа."""
+    import hashlib
+    h = hashlib.sha256(b"jpgs-key-fingerprint:" + material).hexdigest()
     return f"{h[0:4]}-{h[4:8]}-{h[8:12]}".upper()
 
 
-def configured_key() -> str:
-    """Ключ: переменная JPGS_KEY → файл ~/.config/jpgs/key → (устар.) settings.json.
+def fingerprint(key: str) -> str:
+    """Отпечаток ключа старого формата — сверить, что на двух компьютерах ключ одинаковый.
 
-    Встроенного ключа нет: его задают при установке или при первом запуске.
+    Значения намеренно совпадают с прежними версиями (считается от key_bytes).
     """
-    env = os.environ.get(KEY_ENV)
-    if env:
-        return env
+    return fingerprint_material(key_bytes(key))
+
+
+def _legacy_key() -> str | None:
+    """Ключ из старых мест: файл ~/.config/jpgs/key → (устар.) settings.json."""
     try:
         with open(key_file(), encoding="utf-8") as f:
             k = f.read().strip("\r\n")
@@ -66,12 +101,55 @@ def configured_key() -> str:
                 return k
     except (OSError, ValueError):
         pass
+    return None
+
+
+def configured_key() -> str:
+    """Активное ключевое слово: JPGS_WORD → JPGS_KEY → хранилище → (устар.) ~/.config/jpgs/key.
+
+    Возвращает именно слово. Для шифрования нужны байты — см. configured_material():
+    у ключей нового формата слово и байты уже не одно и то же.
+    """
+    env = os.environ.get(WORD_ENV) or os.environ.get(KEY_ENV)
+    if env:
+        return env
+    from . import keystore  # ленивый импорт: keystore зависит от crypto
+    ks = keystore.get_keystore()
+    if ks.exists():
+        return ks.active_key()  # может поднять KeyLocked / KeyMissing
+    legacy = _legacy_key()
+    if legacy:
+        return legacy
+    raise KeyMissing("Ключ шифрования не задан. Выполните: jpgs set-key")
+
+
+def configured_material() -> bytes:
+    """Байты активного ключа — то, чем реально шифруется.
+
+    JPGS_WORD — слово нового формата (усиливается), JPGS_KEY — ключ старого формата
+    (байты как есть, поведение прежних версий не меняется). Дальше — активный ключ
+    хранилища с его собственным типом, затем старый файл ~/.config/jpgs/key.
+    """
+    word = os.environ.get(WORD_ENV)
+    if word:
+        return derive_material(word)
+    env = os.environ.get(KEY_ENV)
+    if env:
+        return key_bytes(env)
+    from . import keystore
+    ks = keystore.get_keystore()
+    if ks.exists():
+        return ks.active_material()  # может поднять KeyLocked / KeyMissing
+    legacy = _legacy_key()
+    if legacy:
+        return key_bytes(legacy)
     raise KeyMissing("Ключ шифрования не задан. Выполните: jpgs set-key")
 
 
 def has_key() -> bool:
+    """Есть ли рабочий ключ. Проверяем именно байты: слово может не храниться."""
     try:
-        configured_key()
+        configured_material()
         return True
     except KeyMissing:
         return False
@@ -156,18 +234,43 @@ class _OpenSSLBackend:
         return self._run(data, True)
 
 
-class Cipher:
-    """AES-256-ECB. *_blocks — без паддинга (длина кратна 16)."""
+def _make_backend(kb: bytes, backend: str | None = None):
+    """Лучший доступный AES-бэкенд для 32-байтного ключа."""
+    if backend == "openssl":
+        return _OpenSSLBackend(kb)
+    try:
+        return _CryptographyBackend(kb)
+    except ImportError:
+        return _OpenSSLBackend(kb)
 
-    def __init__(self, key: str | None = None, backend: str | None = None):
-        kb = key_bytes(key if key is not None else configured_key())
-        if backend == "openssl":
-            self._b = _OpenSSLBackend(kb)
-        else:
-            try:
-                self._b = _CryptographyBackend(kb)
-            except ImportError:
-                self._b = _OpenSSLBackend(kb)
+
+def block_cipher(key32: bytes, backend: str | None = None):
+    """AES-256-ECB над готовыми 32 байтами ключа (без key_bytes-дополнения).
+
+    Отдаёт объект с encrypt_blocks/decrypt_blocks — низкоуровневый примитив,
+    на котором keystore строит CBC для шифрования хранилища ключей паролем.
+    """
+    if len(key32) != 32:
+        raise ValueError("нужен 32-байтный ключ")
+    return _make_backend(key32, backend)
+
+
+class Cipher:
+    """AES-256-ECB. *_blocks — без паддинга (длина кратна 16).
+
+    Cipher()                      — активный ключ (хранилище/окружение);
+    Cipher(material=b"…32 байта") — готовые байты ключа (ключ любого формата);
+    Cipher("слово")               — СТАРЫЙ формат (байты слова), оставлен для совместимости
+                                    со скриптами и файлами прежних версий.
+    """
+
+    def __init__(self, key: str | None = None, backend: str | None = None,
+                 material: bytes | None = None):
+        if material is None:
+            material = key_bytes(key) if key is not None else configured_material()
+        if len(material) != 32:
+            raise ValueError("ключ должен быть длиной 32 байта")
+        self._b = _make_backend(material, backend)
         self.backend = type(self._b).__name__
 
     def decrypt_blocks(self, data: bytes) -> bytes:

@@ -607,6 +607,93 @@ def rewrite_frames(path: str, order: list[int], cipher: Cipher) -> None:
         raise
 
 
+def reencrypt_jpgs(path: str, old: Cipher, new: Cipher) -> None:
+    """Перешифровывает архив .jpgs со старого ключа на новый (кадры сохраняются)."""
+    rs = JpgsFile(path, old).ranges()
+    if not rs:
+        raise ArchiveError("файл не расшифровывается текущим ключом (или в нём нет кадров)")
+    tmp = os.path.join(os.path.dirname(path), f".{os.path.basename(path)}.{os.getpid()}.rekey")
+    try:
+        with DecryptingReader(path, old) as r, open(tmp, "wb") as out:
+            for s, e in rs:
+                out.write(new.encrypt(r.read(s, e - s)))
+            out.flush()
+            os.fsync(out.fileno())
+        try:
+            os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def reencrypt_vids(path: str, old: Cipher, new: Cipher,
+                   progress: Optional[Callable[[int, int], None]] = None) -> None:
+    """Перешифровывает видео .vids со старого ключа на новый, потоково."""
+    tmp = os.path.join(os.path.dirname(path), f".{os.path.basename(path)}.{os.getpid()}.rekey")
+    try:
+        with DecryptingReader(path, old, max_chunks=2) as r, open(tmp, "wb") as out:
+            pos = 0
+            while pos < r.size:
+                n = min(CHUNK, r.size - pos)
+                plain = r.read(pos, n)
+                pos += n
+                if pos >= r.size:  # последний кусок: восстановить PKCS#7-паддинг
+                    pad = BLOCK - len(plain) % BLOCK
+                    out.write(new.encrypt_blocks(plain + bytes([pad]) * pad))
+                else:
+                    out.write(new.encrypt_blocks(plain))
+                if progress:
+                    progress(pos, r.size)
+        try:
+            os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def reencrypt_media(path: str, old: Cipher, new: Cipher,
+                    progress: Optional[Callable[[int, int], None]] = None) -> None:
+    if is_video_path(path):
+        reencrypt_vids(path, old, new, progress)
+    else:
+        reencrypt_jpgs(path, old, new)
+
+
+_VIDEO_MAGIC_OK = (b"ftyp", b"\x1a\x45\xdf\xa3", b"RIFF", b"FLV", b"OggS",
+                   b"\x00\x00\x01\xba", b"\x30\x26\xb2\x75")
+
+
+def verify_media(path: str, cipher: Cipher) -> bool:
+    """Проверяет, что файл действительно расшифровывается этим ключом (по сигнатуре).
+
+    Нужно перед пакетной сменой ключа, чтобы не «перешифровать» мусором файлы,
+    зашифрованные другим ключом.
+    """
+    try:
+        if is_video_path(path):
+            with DecryptingReader(path, cipher, max_chunks=1) as r:
+                head = r.read(0, 16)
+            if head[4:8] == b"ftyp" or head[:1] == b"\x47":  # mp4/mov или TS
+                return True
+            return any(head.startswith(m) for m in _VIDEO_MAGIC_OK)
+        first = JpgsFile(path, cipher).read_first()
+        return bool(first) and (is_real_jpeg(first) or sniff_ext(first) != "bin")
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def extract_frames(path: str, indices: list[int], cipher: Cipher) -> list[str]:
     """Сохраняет указанные кадры отдельными .jpgs рядом с исходным файлом."""
     jf = JpgsFile(path, cipher)

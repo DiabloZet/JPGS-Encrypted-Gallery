@@ -1,0 +1,2 @@
+#!/bin/sh
+PYTHONPATH="/usr/lib/jpgs${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m jpgs "$@"

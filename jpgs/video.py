@@ -33,14 +33,22 @@ class VideoInfo:
         self.width, self.height, self.duration, self.rotation = width, height, duration, rotation
 
 
-def grab_frame(path: str, cipher: Cipher, max_side: int = 256):
-    """(pixels: bytes, w, h, stride, info) — кадр примерно с 10% длительности."""
+def grab_frame(path: str, cipher: Cipher, max_side: Optional[int] = 256,
+               at: Optional[float] = None):
+    """(pixels: bytes, w, h, stride, info) — кадр из зашифрованного видео.
+
+    at=None — кадр примерно с 10% длительности (для миниатюр); иначе кадр у времени at.
+    max_side=None — без уменьшения (полное разрешение, для сохранения кадра).
+    """
     import av  # PyAV — привязка к libavformat/libavcodec
     with C.DecryptedFile(path, cipher) as f, av.open(f, mode="r") as ct:
         vs = ct.streams.video[0]
         vs.thread_type = "AUTO"
         dur = float(ct.duration) / 1e6 if ct.duration else 0.0
-        target = dur * 0.1 if dur > 3 else 0.0
+        if at is not None:
+            target = max(0.0, at)
+        else:
+            target = dur * 0.1 if dur > 3 else 0.0
         if target and vs.time_base:
             try:
                 ct.seek(int(target / vs.time_base), stream=vs)
@@ -55,14 +63,35 @@ def grab_frame(path: str, cipher: Cipher, max_side: int = 256):
             raise ValueError("в файле нет видеокадров")
         rot = int(round(getattr(frame, "rotation", 0) or 0)) % 360
         w, h = frame.width, frame.height
-        k = min(1.0, max_side / max(w, h))
-        tw, th = max(2, int(w * k) // 2 * 2), max(2, int(h * k) // 2 * 2)
+        if max_side:
+            k = min(1.0, max_side / max(w, h))
+            tw, th = max(2, int(w * k) // 2 * 2), max(2, int(h * k) // 2 * 2)
+        else:
+            tw, th = w, h
         rgb = frame.reformat(width=tw, height=th, format="rgb24")
         plane = rgb.planes[0]
         info = VideoInfo(w, h, dur, rot)
         if rot in (90, 270):
             info.width, info.height = h, w
         return bytes(plane), tw, th, plane.line_size, info
+
+
+def save_frame_png(path: str, cipher: Cipher, time_pos: float, dest: str) -> None:
+    """Сохраняет кадр видео у времени time_pos как PNG (полное разрешение, с учётом поворота).
+
+    Декодирует нужный кадр через PyAV прямо из зашифрованного потока — надёжнее, чем
+    screenshot в mpv при аппаратном декодировании и выводе через render API.
+    """
+    import gi
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf, GLib
+    data, w, h, stride, info = grab_frame(path, cipher, max_side=None, at=time_pos)
+    pb = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(data), GdkPixbuf.Colorspace.RGB,
+                                         False, 8, w, h, stride)
+    if info.rotation:
+        pb = pb.rotate_simple(GdkPixbuf.PixbufRotation(info.rotation)) or pb
+    if not pb.savev(dest, "png", [], []):
+        raise OSError("не удалось записать PNG")
 
 
 def frame_pixbuf(path: str, cipher: Cipher, max_side: int = 256):

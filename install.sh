@@ -62,8 +62,12 @@ for f in "$SRC"/integration/nemo/*.nemo_action; do
 done
 
 echo "==> Ключ шифрования"
-if [ -n "${JPGS_KEY:-}" ] || [ -s "${XDG_CONFIG_HOME:-$HOME/.config}/jpgs/key" ]; then
-    echo "   $("$BIN" key 2>/dev/null || echo "Ключ уже задан (~/.config/jpgs/key)")"
+JPGS_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/jpgs"
+# ключ может лежать в хранилище (keystore.json), в старом файле key или в окружении;
+# `jpgs key` запускаем со stdin из /dev/null, чтобы он не спрашивал пароль во время установки
+if [ -n "${JPGS_KEY:-}" ] || [ -n "${JPGS_WORD:-}" ] || [ -s "$JPGS_CFG/keystore.json" ] \
+   || [ -s "$JPGS_CFG/key" ]; then
+    echo "   $("$BIN" key </dev/null 2>/dev/null || echo "Ключ уже задан")"
 elif [ -t 0 ]; then
     echo "   Ключ нужен для шифрования и открытия файлов. Встроенного ключа нет."
     echo "   Если у вас уже есть зашифрованные файлы — введите тот же ключ, которым они созданы."

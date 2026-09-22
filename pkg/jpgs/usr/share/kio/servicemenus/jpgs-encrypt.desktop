@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Service
+MimeType=image/jpeg;image/png;image/bmp;image/gif;image/tiff;image/webp;video/*;
+Actions=encrypt;
+
+[Desktop Action encrypt]
+Name=Encrypt (.jpgs / .vids)
+Name[ru]=Зашифровать (.jpgs / .vids)
+Icon=org.jpgs.JPGS
+Exec=/usr/bin/jpgs --encrypt %F

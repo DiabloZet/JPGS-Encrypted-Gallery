@@ -1,0 +1,7 @@
+[Nemo Action]
+Name=Расшифровать сюда
+Comment=Расшифровать сюда
+Exec=/usr/bin/jpgs decrypt %F
+Icon-Name=document-decrypt
+Selection=notnone
+Extensions=jpgs;vids;

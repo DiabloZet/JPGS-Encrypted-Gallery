@@ -1,0 +1,7 @@
+[Nemo Action]
+Name=Зашифровать (.jpgs / .vids)
+Comment=Зашифровать изображения и видео
+Exec=/usr/bin/jpgs --encrypt %F
+Icon-Name=org.jpgs.JPGS
+Selection=notnone
+Extensions=jpg;jpeg;png;bmp;gif;tif;tiff;webp;mp4;m4v;mov;mkv;webm;avi;wmv;flv;3gp;ts;mts;m2ts;mpg;mpeg;ogv;
