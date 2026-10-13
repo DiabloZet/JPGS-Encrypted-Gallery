@@ -10,3 +10,4 @@ key
 *.jpgs
 *.vids
 !tests/**
+tests/**/__pycache__/
