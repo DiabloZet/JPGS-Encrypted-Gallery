@@ -356,8 +356,62 @@ def is_video_path(path: str) -> bool:
     return path.lower().endswith(".vids")
 
 
+def gif_frame_count(path: str, limit: int = 2) -> int:
+    """Число кадров GIF (подсчёт останавливается на limit). 0 — не GIF или файл битый.
+
+    Разбирает только структуру блоков, пиксели не распаковывает — быстро даже для больших файлов.
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return 0
+    if data[:6] not in (b"GIF87a", b"GIF89a") or len(data) < 13:
+        return 0
+    p = 13
+    if data[10] & 0x80:  # глобальная палитра
+        p += 3 << ((data[10] & 7) + 1)
+    frames = 0
+
+    def skip_sub_blocks(p: int) -> int:
+        while p < len(data):
+            n = data[p]
+            p += 1 + n
+            if n == 0:
+                return p
+        return -1
+
+    while p < len(data) and frames < limit:
+        b = data[p]
+        if b == 0x3B:  # конец файла
+            break
+        if b == 0x21:  # расширение
+            p = skip_sub_blocks(p + 2)
+        elif b == 0x2C:  # кадр
+            if p + 10 > len(data):
+                break
+            flags = data[p + 9]
+            p += 10
+            if flags & 0x80:  # локальная палитра
+                p += 3 << ((flags & 7) + 1)
+            p = skip_sub_blocks(p + 1)  # +1 — минимальный размер кода LZW
+            if p < 0:
+                break
+            frames += 1
+        else:
+            break
+        if p < 0:
+            break
+    return frames
+
+
+def is_animated_gif(path: str) -> bool:
+    return path.lower().endswith(".gif") and gif_frame_count(path) > 1
+
+
 def is_video_source(path: str) -> bool:
-    return path.rsplit(".", 1)[-1].lower() in VIDEO_EXTS
+    """Что шифровать в .vids: видео и анимированные GIF (в .jpgs анимация потерялась бы)."""
+    return path.rsplit(".", 1)[-1].lower() in VIDEO_EXTS or is_animated_gif(path)
 
 
 def encrypt_stream(src: str, out_dir: str, cipher: Cipher,
@@ -394,6 +448,8 @@ def encrypt_stream(src: str, out_dir: str, cipher: Cipher,
 
 
 def sniff_video_ext(head: bytes) -> str:
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
     if head[4:8] == b"ftyp":
         brand = head[8:12]
         return "mov" if brand == b"qt  " else "mp4"
@@ -556,6 +612,9 @@ def append_frames(target: str, sources: list[str], cipher: Cipher) -> int:
             parts.append(("file", src))
             added += jf.count()
         else:
+            if is_animated_gif(src):
+                raise ArchiveError(f"{os.path.basename(src)}: анимированный GIF — "
+                                   "его можно зашифровать отдельно, в .vids")
             data = to_jpeg_bytes(src)
             if data is None:
                 raise ArchiveError(f"{os.path.basename(src)}: не изображение")
@@ -672,7 +731,7 @@ def reencrypt_media(path: str, old: Cipher, new: Cipher,
 
 
 _VIDEO_MAGIC_OK = (b"ftyp", b"\x1a\x45\xdf\xa3", b"RIFF", b"FLV", b"OggS",
-                   b"\x00\x00\x01\xba", b"\x30\x26\xb2\x75")
+                   b"\x00\x00\x01\xba", b"\x30\x26\xb2\x75", b"GIF8")
 
 
 def verify_media(path: str, cipher: Cipher) -> bool:

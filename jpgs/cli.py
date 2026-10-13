@@ -318,7 +318,7 @@ def _main(cmd: str, rest: list[str]) -> int:
             if not os.path.isfile(p) or ext not in C.IMAGE_EXTS + C.VIDEO_EXTS:
                 continue
             try:
-                out = (C.encrypt_stream(p, cwd, cipher) if ext in C.VIDEO_EXTS
+                out = (C.encrypt_stream(p, cwd, cipher) if C.is_video_source(p)
                        else C.encrypt_file(p, cwd, cipher))
             except Exception as e:  # noqa: BLE001
                 print(f"Ошибка обработки файла {name}: {e}")

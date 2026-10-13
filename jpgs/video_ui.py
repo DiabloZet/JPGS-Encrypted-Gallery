@@ -9,6 +9,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gdk, Gtk  # noqa: E402
 
+from . import container as C  # noqa: E402
 from .video import MpvPlayer, libmpv  # noqa: E402
 
 EDGE_CLICK = 100
@@ -171,6 +172,7 @@ class VideoPane(Gtk.Overlay):
         if not self._ensure_player():
             return False
         self.player.set("pause", False)
+        self.player.set("loop-file", "inf" if self._loops(path) else "no")
         if self.gl_ready:
             self.player.load(path)
         else:
@@ -215,8 +217,18 @@ class VideoPane(Gtk.Overlay):
         if self.player is not None:
             self.player.command("cycle", "mute")
 
+    def _loops(self, path: str) -> bool:
+        """GIF всегда крутится по кругу, остальное — по настройке «Повторять видео»."""
+        if self.win.app.settings.get("loop_video"):
+            return True
+        try:
+            return C.VidsFile(path, self.win.cipher).video_ext() == "gif"
+        except OSError:
+            return False
+
     def set_loop(self, on: bool):
-        self._set("loop-file", "inf" if on else "no")
+        cur = self.win.files[self.win.fi].path if self.win.files else None
+        self._set("loop-file", "inf" if on or (cur and self._loops(cur)) else "no")
 
     def _seek_changed(self, scale, scroll, value):
         if self.player is not None:

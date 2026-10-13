@@ -46,6 +46,35 @@ class VideoContainerTests(unittest.TestCase):
         self.assertEqual(C.sniff_video_ext(b"\0\0\0\x20ftypisom" + b"\0" * 50), "mp4")
         self.assertEqual(C.sniff_video_ext(b"\x1a\x45\xdf\xa3" + b"webm" + b"\0" * 50), "webm")
         self.assertEqual(C.sniff_video_ext(b"\x1a\x45\xdf\xa3" + b"matroska" + b"\0" * 50), "mkv")
+        self.assertEqual(C.sniff_video_ext(b"GIF89a" + b"\0" * 50), "gif")
+
+    def _gif(self, name, frames):
+        """Минимальный GIF 1×1 с заданным числом кадров."""
+        frame = (b"\x21\xf9\x04\x00\x0a\x00\x00\x00"          # Graphic Control Extension
+                 b"\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00"  # Image Descriptor
+                 b"\x02\x02\x44\x01\x00")                       # LZW-данные
+        data = (b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff"
+                + frame * frames + b"\x3b")
+        p = os.path.join(self.d, name)
+        with open(p, "wb") as f:
+            f.write(data)
+        return p, data
+
+    def test_gif_routing(self):
+        still, _ = self._gif("still.gif", 1)
+        anim, data = self._gif("anim.gif", 3)
+        self.assertEqual(C.gif_frame_count(still), 1)
+        self.assertEqual(C.gif_frame_count(anim, limit=10), 3)
+        self.assertFalse(C.is_video_source(still))
+        self.assertTrue(C.is_video_source(anim))
+        self.assertTrue(C.is_video_source(os.path.join(self.d, "x.webm")))
+        # анимированный GIF шифруется как есть и расшифровывается обратно в .gif
+        out = C.encrypt_stream(anim, self.d, self.c)
+        self.assertTrue(C.verify_media(out, self.c))
+        dec = C.decrypt_video_to(out, os.path.join(self.d, "out"), self.c)
+        self.assertTrue(dec.endswith(".gif"))
+        with open(dec, "rb") as f:
+            self.assertEqual(f.read(), data)
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "нет ffmpeg")
     def test_decrypt_roundtrip_and_frame(self):

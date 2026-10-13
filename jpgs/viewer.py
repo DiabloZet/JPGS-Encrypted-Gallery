@@ -785,8 +785,8 @@ class JpgsWindow(Adw.ApplicationWindow):
         ext = lambda p: p.rsplit(".", 1)[-1].lower()  # noqa: E731
         jpgs = [p for p in paths if ext(p) == "jpgs"]
         vids = [p for p in paths if ext(p) == "vids"]
-        imgs = [p for p in paths if ext(p) in C.IMAGE_EXTS]
-        videos = [p for p in paths if ext(p) in C.VIDEO_EXTS]
+        videos = [p for p in paths if ext(p) in C.IMAGE_EXTS + C.VIDEO_EXTS and C.is_video_source(p)]
+        imgs = [p for p in paths if ext(p) in C.IMAGE_EXTS and p not in videos]
         cur = self.files[self.fi] if self.files else None
         if cur is not None and not cur.is_video and (imgs or jpgs) and self.cipher is not None:
             self._confirm_append(imgs + [p for p in jpgs if p != cur.path], videos)
@@ -806,7 +806,8 @@ class JpgsWindow(Adw.ApplicationWindow):
         d = Adw.AlertDialog(
             heading=f"Добавить {what} в «{cur.name}»?",
             body="Кадры допишутся в конец этого файла — отдельные копии не создаются."
-                 + (f"\nВидео ({len(videos)}) в архив картинок не добавить — их можно зашифровать отдельно."
+                 + (f"\nВидео и анимированные GIF ({len(videos)}) в архив картинок не добавить — "
+                    "их можно зашифровать отдельно."
                     if videos else ""))
         d.add_response("cancel", "Отмена")
         if only_jpgs:
@@ -912,8 +913,9 @@ class JpgsWindow(Adw.ApplicationWindow):
                 files = d.open_multiple_finish(res)
             except GLib.Error:
                 return
-            paths = [files.get_item(i).get_path() for i in range(files.get_n_items())]
-            self._confirm_append([p for p in paths if p], [])
+            paths = [p for p in (files.get_item(i).get_path() for i in range(files.get_n_items())) if p]
+            anim = [p for p in paths if C.is_animated_gif(p)]
+            self._confirm_append([p for p in paths if p not in anim], anim)
         dlg.open_multiple(self, None, done)
 
     def _frames_op(self, label, func, goto):
@@ -1981,7 +1983,7 @@ class JpgsWindow(Adw.ApplicationWindow):
             self.app.require_key(self, lambda: self._confirm_encrypt(paths))
             return
         d = Adw.AlertDialog(heading=f"Зашифровать {plural(len(paths), 'файл', 'файла', 'файлов')}?",
-                            body="Файлы .jpgs (изображения) и .vids (видео) появятся рядом с оригиналами "
+                            body="Файлы .jpgs (изображения) и .vids (видео и анимированные GIF) появятся рядом с оригиналами "
                                  "со случайными именами. Оригиналы можно сразу убрать в корзину.")
         d.add_response("cancel", "Отмена")
         d.add_response("keep", "Зашифровать")
