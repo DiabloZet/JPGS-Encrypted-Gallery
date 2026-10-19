@@ -52,6 +52,8 @@ CSS = b"""
 .filmstrip > row { padding: 3px; border-radius: 10px; background: transparent; }
 .filmstrip > row:selected { background: alpha(@accent_bg_color, 0.85); }
 .thumb { border-radius: 8px; background-color: alpha(@view_fg_color, 0.06); }
+.strip-mode { margin: 6px 0 6px 8px; }
+.strip-mode > button { min-width: 0; min-height: 0; padding: 6px 8px; }
 .video-controls { border-radius: 14px; padding: 4px 10px; }
 .badge { font-size: 0.8em; font-weight: bold; padding: 1px 6px; border-radius: 99px; }
 """
@@ -63,7 +65,8 @@ CSS = b"""
 
 class Settings:
     DEFAULTS = {"upscale_small": True, "filmstrip": True, "slideshow_seconds": 4,
-                "volume": 100, "mute": False, "loop_video": False, "video_simple": False}
+                "volume": 100, "mute": False, "loop_video": False, "video_simple": False,
+                "strip_mode": "files"}
 
     def __init__(self):
         self.path = os.path.join(GLib.get_user_config_dir(), "jpgs", "settings.json")
@@ -364,15 +367,18 @@ class ImageView(Gtk.Widget):
 # ---------------------------------------------------------------------------
 
 class FileItem(GObject.Object):
+    """Элемент ленты: файл целиком (ii=None) или один кадр архива (ii — номер кадра)."""
     __gtype_name__ = "JpgsFileItem"
     thumb = GObject.Property(type=Gdk.Paintable)
     count = GObject.Property(type=int, default=0)
     badge = GObject.Property(type=str, default="")
 
-    def __init__(self, index: int, jf: C.JpgsFile):
+    def __init__(self, index: int, jf: C.JpgsFile, gen: int = 0, ii: Optional[int] = None):
         super().__init__()
-        self.index = index
+        self.index = index      # позиция в ленте
         self.jf = jf
+        self.gen = gen          # поколение ленты: после пересборки старые миниатюры не нужны
+        self.ii = ii
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +411,8 @@ class JpgsWindow(Adw.ApplicationWindow):
         self.thumb_queue: list[FileItem] = []
         self.thumb_pending: set[int] = set()
         self.thumb_lock = threading.Lock()
+        self.strip_gen = 0
+        self.strip_fi: Optional[int] = None   # чьи кадры сейчас в ленте (режим «кадры»)
         self._spinner_src = 0
         self._hide_nav_src = 0
         self._slideshow_src = 0
@@ -563,7 +571,19 @@ class JpgsWindow(Adw.ApplicationWindow):
         strip_scroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         strip_scroll.connect("scroll", self._strip_scroll)
         sc.add_controller(strip_scroll)
-        self.strip_revealer = Gtk.Revealer(child=sc, reveal_child=False,
+        sc.set_hexpand(True)
+        mode = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER,
+                       css_classes=["linked", "strip-mode"])
+        for icon, target, tip in (("folder-symbolic", "files", "Лента: файлы папки"),
+                                  ("view-grid-symbolic", "frames",
+                                   "Лента: кадры текущего файла (Shift+T — переключить)")):
+            mode.append(Gtk.ToggleButton(icon_name=icon, tooltip_text=tip, focus_on_click=False,
+                                         action_name="win.strip-mode",
+                                         action_target=GLib.Variant("s", target)))
+        bar = Gtk.Box()
+        bar.append(mode)
+        bar.append(sc)
+        self.strip_revealer = Gtk.Revealer(child=bar, reveal_child=False,
                                            transition_type=Gtk.RevealerTransitionType.SLIDE_UP)
         self.tv.add_bottom_bar(self.strip_revealer)
 
@@ -653,6 +673,15 @@ class JpgsWindow(Adw.ApplicationWindow):
                                            GLib.Variant("b", self.app.settings.get("filmstrip")))
         fs.connect("activate", self._toggle_filmstrip)
         self.add_action(fs)
+        sm = Gio.SimpleAction.new_stateful(
+            "strip-mode", GLib.VariantType.new("s"),
+            GLib.Variant("s", "frames" if self.app.settings.get("strip_mode") == "frames" else "files"))
+        sm.connect("activate", lambda a, p: self._set_strip_mode(p.get_string()))
+        self.add_action(sm)
+        sc = Gio.SimpleAction.new("strip-mode-cycle", None)
+        sc.connect("activate", lambda *_: self._set_strip_mode(
+            "files" if self._frames_mode() else "frames"))
+        self.add_action(sc)
         up = Gio.SimpleAction.new_stateful("upscale", None,
                                            GLib.Variant("b", self.app.settings.get("upscale_small")))
         up.connect("activate", self._toggle_upscale)
@@ -711,9 +740,60 @@ class JpgsWindow(Adw.ApplicationWindow):
         self.view.zoom_fit(animate=False)
 
     def _update_strip_visibility(self):
-        on = (self.app.settings.get("filmstrip") and len(self.files) > 1
-              and not self.is_fullscreen())
-        self.strip_revealer.set_reveal_child(on)
+        many = len(self.files) > 1 or (self.files and (self.counts.get(self.fi) or 0) > 1)
+        on = bool(self.app.settings.get("filmstrip") and many and not self.is_fullscreen())
+        if on and not self.strip_revealer.get_reveal_child():
+            self.strip_revealer.set_reveal_child(True)
+            GLib.idle_add(lambda: self._scroll_strip() and False)
+        else:
+            self.strip_revealer.set_reveal_child(on)
+
+    def _frames_mode(self) -> bool:
+        return self.app.settings.get("strip_mode") == "frames"
+
+    def _set_strip_mode(self, mode: str):
+        if mode not in ("files", "frames"):
+            return
+        self.lookup_action("strip-mode").set_state(GLib.Variant("s", mode))
+        if mode == self.app.settings.get("strip_mode"):
+            return
+        self.app.settings.set("strip_mode", mode)
+        if not self.app.settings.get("filmstrip"):
+            self.activate_action("win.filmstrip", None)
+        self._rebuild_strip()
+        self._sync_strip()
+
+    def _rebuild_strip(self):
+        """Заполняет ленту: файлы папки или кадры текущего файла."""
+        self.strip_gen += 1
+        with self.thumb_lock:
+            self.thumb_queue.clear()
+            self.thumb_pending.clear()
+            self.thumb_lru.clear()
+        self.store.remove_all()
+        if not self.files:
+            self.strip_fi = None
+            return
+        if not self._frames_mode():
+            self.strip_fi = None
+            items = []
+            for i, f in enumerate(self.files):
+                it = FileItem(i, f, self.strip_gen)
+                n = self.counts.get(i)
+                if n and n > 1 and not f.is_video:
+                    it.count, it.badge = n, f"×{n}"
+                items.append(it)
+            self.store.splice(0, 0, items)
+            return
+        fi = self.fi
+        self.strip_fi = fi
+        jf = self.files[fi]
+        if jf.is_video:
+            self.store.append(FileItem(0, jf, self.strip_gen))
+            return
+        n = self.counts.get(fi)  # пока кадры не посчитаны — лента пустая, заполнит _job_done
+        if n:
+            self.store.splice(0, 0, [FileItem(k, jf, self.strip_gen, k) for k in range(n)])
 
     # ---------------------------------------------------------------- открытие
 
@@ -746,12 +826,8 @@ class JpgsWindow(Adw.ApplicationWindow):
         with self.bytes_lock:
             self.bytes_cache.clear()
             self.bytes_total = 0
-        with self.thumb_lock:
-            self.thumb_queue.clear()
-            self.thumb_pending.clear()
-            self.thumb_lru.clear()
-        self.store.remove_all()
-        self.store.splice(0, 0, [FileItem(i, f) for i, f in enumerate(self.files)])
+        self.fi = start
+        self._rebuild_strip()
         self._update_strip_visibility()
         self.show(start, 0)
 
@@ -848,20 +924,24 @@ class JpgsWindow(Adw.ApplicationWindow):
         with self.bytes_lock:
             for k in [k for k in self.bytes_cache if k[0] == jf.path]:
                 self.bytes_total -= len(self.bytes_cache.pop(k))
-        item = self.store.get_item(fi)
-        if item is not None:
-            item.thumb = None
-            item.badge = ""
-            with self.thumb_lock:
-                self.thumb_lru.pop(fi, None)
-            self._queue_thumb(item)
+        if self._frames_mode():
+            if self.strip_fi == fi:
+                self._rebuild_strip()  # кадры переставлены/удалены — лента заполнится заново
+        else:
+            item = self.store.get_item(fi)
+            if item is not None:
+                item.thumb = None
+                item.badge = ""
+                with self.thumb_lock:
+                    self.thumb_lru.pop(fi, None)
+                self._queue_thumb(item)
         self.show(fi, goto_ii)
 
     def _reload_folder(self, select_path: Optional[str], ii: int = 0):
         paths = C.list_media(self.folder) if self.folder else []
         if not paths:
             self.files = []
-            self.store.remove_all()
+            self._rebuild_strip()
             self.view.clear()
             self.video.stop()
             self._update_title()
@@ -1517,10 +1597,17 @@ class JpgsWindow(Adw.ApplicationWindow):
             return False
         if self.counts.get(fi) != n:
             self.counts[fi] = n
-            item = self.store.get_item(fi)
-            if item:
-                item.count = n
-                item.badge = f"×{n}" if n > 1 else ""
+            if self._frames_mode():
+                if self.strip_fi == fi:
+                    self._rebuild_strip()
+                    self._sync_strip()
+            else:
+                item = self.store.get_item(fi)
+                if item:
+                    item.count = n
+                    item.badge = f"×{n}" if n > 1 else ""
+            if fi == self.fi:
+                self._update_strip_visibility()
         if fi not in self.relevant:
             return False
         tex = dec.texture()
@@ -1639,7 +1726,7 @@ class JpgsWindow(Adw.ApplicationWindow):
             (item, item.connect("notify::thumb", lambda it, _p: ov.pic.set_paintable(it.thumb))),
             (item, item.connect("notify::badge", lambda it, _p: self._set_badge(ov, it.badge))),
         ]
-        ov.set_tooltip_text(item.jf.name)
+        ov.set_tooltip_text(item.jf.name if item.ii is None else f"Кадр {item.ii + 1}")
         if item.thumb is None:
             self._queue_thumb(item)
         else:
@@ -1677,28 +1764,32 @@ class JpgsWindow(Adw.ApplicationWindow):
                 return
             item = self.thumb_queue.pop()  # последним запрошенный = видимый сейчас
         try:
-            if files_ref is not self.files:
+            if files_ref is not self.files or item.gen != self.strip_gen:
                 return
             if item.jf.is_video:
                 from .video import frame_pixbuf
                 pb, info = frame_pixbuf(item.jf.path, self.cipher, THUMB_SIDE)
                 GLib.idle_add(self._video_thumb_done, files_ref, item, pb, info)
                 return
-            data = item.jf.read_first()
+            data = item.jf.read_first() if item.ii is None else item.jf.read_image(item.ii)
             if not data:
                 raise DecodeError("пусто")
             dec = decode(data, THUMB_SIDE)
         except Exception:  # noqa: BLE001
-            GLib.idle_add(self.thumb_pending.discard, item.index)
-            if item.jf.is_video:
-                GLib.idle_add(lambda: setattr(item, "badge", "▶") or False)
+            def failed():
+                if item.gen == self.strip_gen:
+                    self.thumb_pending.discard(item.index)
+                    if item.jf.is_video:
+                        item.badge = "▶"
+                return False
+            GLib.idle_add(failed)
             return
         GLib.idle_add(self._thumb_done, files_ref, item, dec)
 
     def _video_thumb_done(self, files_ref, item, pb, info):
-        self.thumb_pending.discard(item.index)
-        if files_ref is not self.files:
+        if files_ref is not self.files or item.gen != self.strip_gen:
             return False
+        self.thumb_pending.discard(item.index)
         fmt = Gdk.MemoryFormat.R8G8B8A8 if pb.get_has_alpha() else Gdk.MemoryFormat.R8G8B8
         item.thumb = Gdk.MemoryTexture.new(pb.get_width(), pb.get_height(), fmt,
                                            pb.read_pixel_bytes(), pb.get_rowstride())
@@ -1711,10 +1802,12 @@ class JpgsWindow(Adw.ApplicationWindow):
         return False
 
     def _thumb_done(self, files_ref, item, dec):
-        self.thumb_pending.discard(item.index)
-        if files_ref is not self.files:
+        if files_ref is not self.files or item.gen != self.strip_gen:
             return False
+        self.thumb_pending.discard(item.index)
         item.thumb = dec.texture()
+        if item.ii is not None:
+            item.badge = str(item.ii + 1)
         with self.thumb_lock:
             self.thumb_lru[item.index] = item
             self.thumb_lru.move_to_end(item.index)
@@ -1723,14 +1816,28 @@ class JpgsWindow(Adw.ApplicationWindow):
                 old.thumb = None
         return False
 
+    def _strip_pos(self) -> int:
+        """Какой элемент ленты соответствует текущему изображению."""
+        if not self._frames_mode():
+            return self.fi
+        ii = self._resolve(self.fi, self.ii)
+        return ii if 0 <= ii < self.store.get_n_items() else Gtk.INVALID_LIST_POSITION
+
     def _sync_strip(self):
         if not self.files:
             return
+        if self._frames_mode() and self.strip_fi != self.fi:
+            self._rebuild_strip()  # перешли в другой файл — показываем его кадры
+        self._update_strip_visibility()
         self._syncing = True
-        self.sel.set_selected(self.fi)
+        self.sel.set_selected(self._strip_pos())
         self._syncing = False
-        if self.strip_revealer.get_reveal_child():
-            self.strip.scroll_to(self.fi, Gtk.ListScrollFlags.NONE, None)
+        self._scroll_strip()
+
+    def _scroll_strip(self):
+        pos = self._strip_pos()
+        if self.strip_revealer.get_reveal_child() and pos != Gtk.INVALID_LIST_POSITION:
+            self.strip.scroll_to(pos, Gtk.ListScrollFlags.NONE, None)
 
     def _strip_scroll(self, ctl, dx, dy):
         adj = self.strip_sw.get_hadjustment()
@@ -1745,9 +1852,14 @@ class JpgsWindow(Adw.ApplicationWindow):
         if self._syncing:
             return
         pos = sel.get_selected()
-        if pos != Gtk.INVALID_LIST_POSITION and pos != self.fi:
+        if pos == Gtk.INVALID_LIST_POSITION or pos == self._strip_pos():
+            return
+        if self._frames_mode():
+            if self.strip_fi is not None and self.strip_fi < len(self.files):
+                self.show(self.strip_fi, pos)
+        else:
             self.show(pos, 0)
-            self.view.grab_focus()
+        self.view.grab_focus()
 
     # ---------------------------------------------------------------- кнопки ← →
 
@@ -1933,7 +2045,7 @@ class JpgsWindow(Adw.ApplicationWindow):
             paths = [f.path for f in self.files if f is not jf]
             if not paths:
                 self.files = []
-                self.store.remove_all()
+                self._rebuild_strip()
                 self.view.clear()
                 self._update_title()
                 self._update_actions()
@@ -2109,7 +2221,7 @@ class JpgsWindow(Adw.ApplicationWindow):
                 "Колёсико, + / −, щипок — масштаб; 0 — вписать; 1 — 100%\n"
                 "Двойной клик — вписать ↔ увеличить; перетаскивание — сдвиг\n"
                 "R / Shift+R — поворот\nF, F11 — полный экран; Esc — выход\n"
-                "F5 — слайд-шоу; T — лента миниатюр\n"
+                "F5 — слайд-шоу; T — лента миниатюр; Shift+T — лента: файлы ↔ кадры\n"
                 "Ctrl+S — сохранить; Ctrl+C — копировать; Delete — в корзину\n"
                 "Ctrl+O — открыть; Ctrl+W — закрыть\n\n"
                 "Видео: Пробел или клик — пауза; двойной клик — полный экран;\n"
@@ -2196,6 +2308,7 @@ class JpgsApp(Adw.Application):
             "win.escape": ["Escape"],
             "win.slideshow": ["F5"],
             "win.filmstrip": ["t"],
+            "win.strip-mode-cycle": ["<Shift>t"],
             "win.open": ["<Control>o"],
             "win.save-as": ["<Control>s"],
             "win.copy": ["<Control>c"],
