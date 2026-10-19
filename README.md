@@ -4,7 +4,7 @@
 Файлы расшифровываются только в памяти: на диск ничего не пишется, в историю системы ничего не попадает.
 GTK 4 + libadwaita, нативно под Wayland, видео через libmpv / FFmpeg.
 
-![Python](https://img.shields.io/badge/Python-3.10+-3776ab) ![GTK 4](https://img.shields.io/badge/GTK-4-4a86cf) ![Wayland](https://img.shields.io/badge/Wayland-native-green) ![FFmpeg](https://img.shields.io/badge/video-libmpv%20%2F%20FFmpeg-orange) ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
+![Python](https://img.shields.io/badge/Python-3.10+-3776ab) ![GTK 4](https://img.shields.io/badge/GTK-4-4a86cf) ![Wayland](https://img.shields.io/badge/Wayland-native-green) ![FFmpeg](https://img.shields.io/badge/video-libmpv%20%2F%20FFmpeg-orange) ![License: GPLv3]([https://img.shields.io/badge/license-GNU/GPLv3-blue)
 
 ![Просмотр](docs/viewer.jpg)
 
