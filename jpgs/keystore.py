@@ -6,7 +6,9 @@
 соль и HMAC-проверка (по ним нельзя восстановить пароль, но можно проверить введённый).
 
 Шифрование хранилища:
-  * ключ выводится из пароля через PBKDF2-HMAC-SHA256 (стандартная библиотека);
+  * ключ выводится из пароля через scrypt (N=2^17, r=8 — 128 МиБ памяти на попытку) со
+    случайной солью; хранилища прежних версий (PBKDF2) читаются и при первом же сохранении
+    переводятся на scrypt;
   * список ключей шифруется AES-256-CBC — CBC собран поверх того же блочного AES,
     что и весь проект (crypto.block_cipher), поэтому не зависит от бэкенда и не «светит»
     одинаковые блоки, как ECB;
@@ -23,6 +25,11 @@
   {"version":1, "active":"<id>", "keys":[{"id","name","kind","material","weak"}, ...]}
 Формат с паролем:
   {"version":1, "encrypted":true, "kdf":{...}, "iv":"hex", "ct":"hex", "mac":"hex"}
+
+Запоминание пароля (необязательно, settings.json → "unlock_minutes"): после ввода пароля
+выведенные из него ключи хранилища (не сам пароль) кладутся в $XDG_RUNTIME_DIR — это
+каталог в памяти (tmpfs), доступный только пользователю и очищаемый при выходе из системы.
+До истечения срока программа открывается без пароля. «Заблокировать сейчас» стирает его.
 """
 
 from __future__ import annotations
@@ -32,12 +39,15 @@ import hmac
 import json
 import os
 import secrets
+import time
 from typing import Optional
 
-from .crypto import (BLOCK, KeyLocked, KeyMissing, block_cipher, config_dir,
-                     fingerprint_material, key_file, material_for, _legacy_key)
+from .crypto import (DEFAULT_KIND, KEY_KINDS, SCRYPT_MAXMEM, KeyLocked, KeyMissing,
+                     cbc_decrypt, cbc_encrypt, config_dir, fingerprint_material, key_file, key_strength,
+                     material_for, _legacy_key)
 
-PBKDF2_ITERS = 200_000
+PBKDF2_ITERS = 200_000          # только для чтения хранилищ прежних версий
+PW_SCRYPT = {"n": 1 << 17, "r": 8, "p": 1}
 _VERSION = 1
 
 
@@ -45,53 +55,73 @@ def keystore_file() -> str:
     return os.path.join(config_dir(), "keystore.json")
 
 
-# --------------------------------------------------------------------------- CBC поверх ECB
-
-def _pkcs7(data: bytes) -> bytes:
-    pad = BLOCK - len(data) % BLOCK
-    return data + bytes([pad]) * pad
+# CBC (cbc_encrypt / cbc_decrypt) — в crypto.py: им же шифруется индекс архивов.
+_cbc_encrypt, _cbc_decrypt = cbc_encrypt, cbc_decrypt
 
 
-def _unpkcs7(data: bytes) -> bytes:
-    if not data or len(data) % BLOCK:
-        raise ValueError("повреждённые данные")
-    p = data[-1]
-    if p < 1 or p > BLOCK or data[-p:] != bytes([p]) * p:
-        raise ValueError("неверный паддинг")
-    return data[:-p]
-
-
-def _cbc_encrypt(key32: bytes, iv: bytes, plaintext: bytes) -> bytes:
-    bc = block_cipher(key32)
-    data = _pkcs7(plaintext)
-    out = bytearray()
-    prev = iv
-    for i in range(0, len(data), BLOCK):
-        blk = bytes(a ^ b for a, b in zip(data[i:i + BLOCK], prev))
-        prev = bc.encrypt_blocks(blk)
-        out += prev
-    return bytes(out)
-
-
-def _cbc_decrypt(key32: bytes, iv: bytes, ct: bytes) -> bytes:
-    if len(ct) % BLOCK:
-        raise ValueError("повреждённые данные")
-    bc = block_cipher(key32)
-    out = bytearray()
-    prev = iv
-    for i in range(0, len(ct), BLOCK):
-        blk = ct[i:i + BLOCK]
-        dec = bc.decrypt_blocks(blk)
-        out += bytes(a ^ b for a, b in zip(dec, prev))
-        prev = blk
-    return _unpkcs7(bytes(out))
-
-
-def _derive(password: str, salt: bytes, iters: int) -> tuple[bytes, bytes]:
-    """(ключ шифрования, ключ HMAC) из пароля."""
-    enc = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iters, 32)
-    mac = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt + b"\x01mac", iters, 32)
+def _derive(password: str, kdf: dict) -> tuple[bytes, bytes]:
+    """(ключ шифрования, ключ HMAC) из пароля по параметрам kdf из файла."""
+    salt = bytes.fromhex(kdf["salt"])
+    pw = password.encode("utf-8")
+    if kdf.get("algo") == "scrypt":
+        n, r, p = int(kdf["n"]), int(kdf["r"]), int(kdf["p"])
+        if not (1 << 14 <= n <= 1 << 22 and 1 <= r <= 32 and 1 <= p <= 16):
+            raise ValueError("недопустимые параметры scrypt")
+        out = hashlib.scrypt(pw, salt=salt, n=n, r=r, p=p, maxmem=SCRYPT_MAXMEM * 2, dklen=64)
+        return out[:32], out[32:]
+    iters = int(kdf["iters"])
+    if not 1000 <= iters <= 10_000_000:
+        raise ValueError("недопустимое число итераций")
+    enc = hashlib.pbkdf2_hmac("sha256", pw, salt, iters, 32)
+    mac = hashlib.pbkdf2_hmac("sha256", pw, salt + b"\x01mac", iters, 32)
     return enc, mac
+
+
+def _new_kdf() -> dict:
+    return {"algo": "scrypt", "salt": secrets.token_hex(16), **PW_SCRYPT}
+
+
+# --------------------------------------------------------------------------- запоминание пароля
+
+def _settings_path() -> str:
+    return os.path.join(config_dir(), "settings.json")
+
+
+def unlock_minutes() -> int:
+    """Сколько минут помнить пароль (0 — спрашивать каждый раз). Хранится в settings.json."""
+    try:
+        with open(_settings_path(), encoding="utf-8") as f:
+            v = int(json.load(f).get("unlock_minutes") or 0)
+        return max(0, min(v, 7 * 24 * 60))
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
+def _cache_path() -> Optional[str]:
+    """Файл кэша в $XDG_RUNTIME_DIR (tmpfs, 0700). Без него запоминание недоступно."""
+    rt = os.environ.get("XDG_RUNTIME_DIR")
+    if not rt or not os.path.isdir(rt):
+        return None
+    try:
+        st = os.stat(rt)
+        if hasattr(os, "getuid") and (st.st_uid != os.getuid() or st.st_mode & 0o077):
+            return None  # чужой или доступный другим каталог — не доверяем
+    except OSError:
+        return None
+    return os.path.join(rt, "jpgs-unlock.json")
+
+
+def unlock_cache_available() -> bool:
+    return _cache_path() is not None
+
+
+def forget_unlock():
+    p = _cache_path()
+    if p:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------- хранилище
@@ -103,7 +133,7 @@ class Keystore:
         self._encrypted = False
         self._locked = False
         self._data: Optional[dict] = None       # {"active":..., "keys":[...]} когда открыто
-        self._password: Optional[str] = None     # пароль в памяти, пока программа открыта
+        self._keys: Optional[tuple] = None       # (kdf, enc_key, mac_key) пока открыто с паролем
         self._enc: Optional[dict] = None         # kdf/iv/ct/mac когда зашифровано
 
     # ---- загрузка
@@ -116,7 +146,19 @@ class Keystore:
         try:
             with open(path, encoding="utf-8") as f:
                 raw = json.load(f)
+            if not isinstance(raw, dict):
+                raise ValueError("не объект JSON")
+        except FileNotFoundError:
+            self._maybe_migrate_legacy()
+            return
         except (OSError, ValueError):
+            # Файл есть, но не читается: не затираем его новым пустым хранилищем при
+            # следующем сохранении — откладываем копию, чтобы ключи можно было спасти.
+            if os.path.exists(path):
+                try:
+                    os.replace(path, f"{path}.broken-{int(time.time())}")
+                except OSError:
+                    pass
             self._maybe_migrate_legacy()
             return
         self._exists = True
@@ -124,6 +166,7 @@ class Keystore:
             self._encrypted = True
             self._locked = True
             self._enc = raw
+            self._try_cached_unlock()
         else:
             self._data = {"active": raw.get("active"), "keys": list(raw.get("keys", []))}
             if self._normalize():
@@ -171,30 +214,97 @@ class Keystore:
             return True
         if not self._locked:
             return True
+        kdf = self._enc["kdf"]
         try:
-            self._decrypt(password)
-        except (ValueError, KeyError):
+            enc_key, mac_key = _derive(password, kdf)
+            self._decrypt(enc_key, mac_key)
+        except (ValueError, KeyError, TypeError):
             return False
-        self._password = password
+        self._keys = (kdf, enc_key, mac_key)
         self._locked = False
-        if self._normalize():
+        upgrade = kdf.get("algo") != "scrypt"
+        if upgrade:  # хранилище прежней версии (PBKDF2) — перевести на scrypt
+            self._keys = None
+            self._set_password_keys(password)
+        if self._normalize() or upgrade:
             self._save()
+        self._remember()
         return True
 
-    def _decrypt(self, password: str):
+    def lock(self):
+        """Забыть открытое хранилище и сохранённую разблокировку (если пароль задан)."""
+        forget_unlock()
+        if self._encrypted:
+            self._data = None
+            self._keys = None
+            self._locked = True
+
+    def _decrypt(self, enc_key: bytes, mac_key: bytes):
         meta = self._enc
-        kdf = meta["kdf"]
-        salt = bytes.fromhex(kdf["salt"])
-        iters = int(kdf["iters"])
         iv = bytes.fromhex(meta["iv"])
         ct = bytes.fromhex(meta["ct"])
         mac = bytes.fromhex(meta["mac"])
-        enc_key, mac_key = _derive(password, salt, iters)
         if not hmac.compare_digest(mac, hmac.new(mac_key, iv + ct, hashlib.sha256).digest()):
             raise ValueError("неверный пароль")
         plain = _cbc_decrypt(enc_key, iv, ct)
         payload = json.loads(plain.decode("utf-8"))
         self._data = {"active": payload.get("active"), "keys": list(payload.get("keys", []))}
+
+    def _set_password_keys(self, password: str):
+        kdf = _new_kdf()
+        enc_key, mac_key = _derive(password, kdf)
+        self._keys = (kdf, enc_key, mac_key)
+
+    # ---- запоминание разблокировки
+
+    def _remember(self):
+        mins = unlock_minutes()
+        path = _cache_path()
+        if not mins or not path or not self._keys:
+            forget_unlock()
+            return
+        kdf, enc_key, mac_key = self._keys
+        doc = {"salt": kdf["salt"], "enc": enc_key.hex(), "mac": mac_key.hex(),
+               "expires": time.time() + mins * 60}
+        try:
+            fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(doc, f)
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass
+
+    def _try_cached_unlock(self):
+        path = _cache_path()
+        if not path or not unlock_minutes():
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = json.load(f)
+            if float(doc["expires"]) < time.time():
+                raise ValueError("срок истёк")
+            kdf = self._enc["kdf"]
+            if doc["salt"] != kdf.get("salt"):
+                raise ValueError("пароль сменился")
+            enc_key, mac_key = bytes.fromhex(doc["enc"]), bytes.fromhex(doc["mac"])
+            self._decrypt(enc_key, mac_key)
+        except (OSError, ValueError, KeyError, TypeError):
+            forget_unlock()
+            return
+        self._keys = (self._enc["kdf"], enc_key, mac_key)
+        self._locked = False
+
+    def unlock_expires(self) -> Optional[float]:
+        """Время (unix), до которого пароль запомнен, или None."""
+        path = _cache_path()
+        if not path:
+            return None
+        try:
+            with open(path, encoding="utf-8") as f:
+                t = float(json.load(f)["expires"])
+            return t if t > time.time() else None
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
 
     def _require_open(self):
         self._load()
@@ -205,7 +315,8 @@ class Keystore:
 
     @staticmethod
     def kind_of(entry: dict) -> str:
-        """Тип записи: 'raw' — старый формат (записи без поля kind), 'derived' — усиленный."""
+        """Тип записи: 'raw' — старый формат (записи без поля kind), 'derived' — PBKDF2,
+        'scrypt' — самый стойкий."""
         return entry.get("kind") or "raw"
 
     def _material_of(self, entry: dict) -> bytes:
@@ -258,7 +369,7 @@ class Keystore:
             if "weak" not in entry:
                 word = entry.get("key")
                 if word is not None:
-                    entry["weak"] = len(word.encode("utf-8")) < 16
+                    entry["weak"] = not key_strength(word)[0]
                     changed = True
             if "key" in entry:  # слову на диске не место
                 del entry["key"]
@@ -314,6 +425,14 @@ class Keystore:
                 return word
         raise KeyError(kid)
 
+    def all_materials(self) -> list[bytes]:
+        """Байты всех ключей (активный первым) — для открытия файлов любым из них."""
+        self._require_open()
+        keys = (self._data or {}).get("keys", [])
+        aid = self._data.get("active") if self._data else None
+        order = sorted(keys, key=lambda k: k["id"] != aid)
+        return [self._material_of(k) for k in order]
+
     def entries(self) -> list[dict]:
         """[{id, name, fingerprint, active, weak, kind}] — для интерфейса и CLI."""
         self._require_open()
@@ -332,22 +451,27 @@ class Keystore:
     # ---- изменения
 
     def add(self, name: str, key: str, activate: Optional[bool] = None,
-            kind: str = "derived") -> str:
-        """Добавить ключ. По умолчанию усиленный (слово → PBKDF2 → 32 байта);
-        kind='raw' — ключ старого формата, чтобы открывать файлы прежних версий."""
+            kind: str = DEFAULT_KIND, material: Optional[bytes] = None) -> str:
+        """Добавить ключ. По умолчанию самый стойкий (слово → scrypt → 32 байта);
+        kind='raw'/'derived' — ключи прежних версий, чтобы открывать их файлы.
+        material — уже посчитанные байты (окно ключей считает их в фоне)."""
         self._require_open()
         if not key:
             raise ValueError("пустой ключ")
-        if kind not in ("derived", "raw"):
+        if kind not in KEY_KINDS:
             raise ValueError("неизвестный тип ключа")
+        if material is None:
+            material = material_for(key, kind)
+        if any(self._material_of(k) == material for k in (self._data or {}).get("keys", [])):
+            raise ValueError("такой ключ уже есть в списке")
         if self._data is None:
             self._data = {"active": None, "keys": []}
             self._exists = True
         kid = secrets.token_hex(6)
         # на диск идут только байты ключа: само слово не сохраняем
         entry = {"id": kid, "name": name or "Ключ", "kind": kind,
-                 "material": material_for(key, kind).hex(),
-                 "weak": len(key.encode("utf-8")) < 16}
+                 "material": material.hex(),
+                 "weak": not key_strength(key)[0]}
         self._data["keys"].append(entry)
         if activate or (activate is None and self._data.get("active") is None):
             self._data["active"] = kid
@@ -355,8 +479,11 @@ class Keystore:
         return kid
 
     def upgrade(self, kid: str, name: Optional[str] = None,
-                activate: bool = False) -> str:
-        """Усилить ключ старого формата: то же слово, но ключ выводится через PBKDF2.
+                activate: bool = False, word: Optional[str] = None) -> str:
+        """Усилить ключ: то же слово, но ключ выводится через scrypt.
+
+        Для ключа старого формата слово восстанавливается из его байтов; для PBKDF2-ключа
+        слово не хранится — его нужно передать (word) и оно проверяется по байтам ключа.
 
         Старая запись остаётся — ею открываются уже существующие файлы, пока они не
         перешифрованы новым ключом (см. container.reencrypt_media).
@@ -364,14 +491,17 @@ class Keystore:
         self._require_open()
         for k in (self._data or {}).get("keys", []):
             if k["id"] == kid:
-                if self.kind_of(k) == "derived":
-                    raise ValueError("этот ключ уже усилен")
-                word = self._word_of(k)  # у старого формата слово выводится из его же байтов
+                kind = self.kind_of(k)
+                if kind == "scrypt":
+                    raise ValueError("этот ключ уже максимально усилен")
                 if word is None:
-                    raise ValueError("не удалось определить слово этого ключа — "
-                                     "добавьте усиленный ключ вручную, введя слово")
+                    word = self._word_of(k)  # у старого формата слово — это его же байты
+                if word is None:
+                    raise ValueError("нужно ввести слово этого ключа")
+                if material_for(word, kind) != self._material_of(k):
+                    raise ValueError("слово не подходит к этому ключу")
                 return self.add(name or f"{k['name']} (усиленный)", word,
-                                activate=activate, kind="derived")
+                                activate=activate, kind="scrypt")
         raise KeyError(kid)
 
     def remove(self, kid: str):
@@ -406,12 +536,15 @@ class Keystore:
         """Задать/сменить пароль (строка) или снять его (None). Требует открытого хранилища."""
         self._require_open()
         if new_password:
-            self._password = new_password
+            self._set_password_keys(new_password)
             self._encrypted = True
         else:
-            self._password = None
+            self._keys = None
             self._encrypted = False
+        forget_unlock()
         self._save()
+        if new_password:
+            self._remember()
 
     # ---- запись
 
@@ -421,15 +554,15 @@ class Keystore:
     def _save(self):
         path = keystore_file()
         os.makedirs(config_dir(), mode=0o700, exist_ok=True)
-        if self._encrypted and self._password:
-            salt = secrets.token_bytes(16)
+        if self._encrypted and not self._keys:
+            raise KeyLocked("хранилище заблокировано — сохранить нельзя")
+        if self._encrypted:
+            kdf, enc_key, mac_key = self._keys
             iv = secrets.token_bytes(16)
-            enc_key, mac_key = _derive(self._password, salt, PBKDF2_ITERS)
             plain = json.dumps(self._payload(), ensure_ascii=False).encode("utf-8")
             ct = _cbc_encrypt(enc_key, iv, plain)
             mac = hmac.new(mac_key, iv + ct, hashlib.sha256).digest()
-            doc = {"version": _VERSION, "encrypted": True,
-                   "kdf": {"algo": "pbkdf2-sha256", "salt": salt.hex(), "iters": PBKDF2_ITERS},
+            doc = {"version": _VERSION, "encrypted": True, "kdf": kdf,
                    "iv": iv.hex(), "ct": ct.hex(), "mac": mac.hex()}
             self._enc = doc
             self._locked = False

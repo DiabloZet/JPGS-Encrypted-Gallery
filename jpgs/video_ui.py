@@ -9,7 +9,6 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gdk, Gtk  # noqa: E402
 
-from . import container as C  # noqa: E402
 from .video import MpvPlayer, libmpv  # noqa: E402
 
 EDGE_CLICK = 100
@@ -33,7 +32,8 @@ class VideoPane(Gtk.Overlay):
         self.gl_ready = False
         self.props = {}
         self.error: Optional[str] = None
-        self._pending: Optional[str] = None
+        self._pending: Optional[tuple] = None   # (путь, ключ, запись) до готовности GL
+        self._ext = ""                          # формат текущего видео (gif крутится по кругу)
 
         self.area = Gtk.GLArea(hexpand=True, vexpand=True, auto_render=False,
                                has_depth_buffer=False, has_stencil_buffer=False, focusable=True)
@@ -145,7 +145,7 @@ class VideoPane(Gtk.Overlay):
             self.error = "Не удалось подключить вывод видео (mpv render API)"
         elif self._pending:
             p, self._pending = self._pending, None
-            self.player.load(p)
+            self.player.load(*p)
 
     def _realize(self, area):
         if self.player is not None and not self.gl_ready:
@@ -165,18 +165,20 @@ class VideoPane(Gtk.Overlay):
 
     # ------------------------------------------------------------------ управление
 
-    def play(self, path: str) -> bool:
+    def play(self, path: str, cipher=None, entry=None, ext: str = "") -> bool:
+        """Воспроизвести .vids (entry=None) или запись-видео архива. cipher — ключ файла."""
         self.error = None
         self.props = {}
+        self._ext = ext
         self._update_labels()
         if not self._ensure_player():
             return False
         self.player.set("pause", False)
-        self.player.set("loop-file", "inf" if self._loops(path) else "no")
+        self.player.set("loop-file", "inf" if self._loops() else "no")
         if self.gl_ready:
-            self.player.load(path)
+            self.player.load(path, cipher, entry)
         else:
-            self._pending = path  # загрузим, когда появится GL-контекст
+            self._pending = (path, cipher, entry)  # загрузим, когда появится GL-контекст
         return True
 
     def stop(self):
@@ -217,18 +219,12 @@ class VideoPane(Gtk.Overlay):
         if self.player is not None:
             self.player.command("cycle", "mute")
 
-    def _loops(self, path: str) -> bool:
+    def _loops(self) -> bool:
         """GIF всегда крутится по кругу, остальное — по настройке «Повторять видео»."""
-        if self.win.app.settings.get("loop_video"):
-            return True
-        try:
-            return C.VidsFile(path, self.win.cipher).video_ext() == "gif"
-        except OSError:
-            return False
+        return bool(self.win.app.settings.get("loop_video")) or self._ext == "gif"
 
     def set_loop(self, on: bool):
-        cur = self.win.files[self.win.fi].path if self.win.files else None
-        self._set("loop-file", "inf" if on or (cur and self._loops(cur)) else "no")
+        self._set("loop-file", "inf" if on or self._ext == "gif" else "no")
 
     def _seek_changed(self, scale, scroll, value):
         if self.player is not None:

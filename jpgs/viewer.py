@@ -14,6 +14,7 @@ import json
 import os
 import threading
 import traceback
+import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
@@ -30,7 +31,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk  # no
 from . import APP_ID, __version__  # noqa: E402
 from . import container as C  # noqa: E402
 from . import keys_ui  # noqa: E402
-from .crypto import Cipher, KeyMissing  # noqa: E402
+from .crypto import Cipher, KeyMissing, KeyRing  # noqa: E402
 from .imaging import DecodeError, decode  # noqa: E402
 from .memory import trim as trim_memory  # noqa: E402
 from .video_ui import VideoPane, fmt_time  # noqa: E402
@@ -52,7 +53,9 @@ CSS = b"""
 .filmstrip > row { padding: 3px; border-radius: 10px; background: transparent; }
 .filmstrip > row:selected { background: alpha(@accent_bg_color, 0.85); }
 .thumb { border-radius: 8px; background-color: alpha(@view_fg_color, 0.06); }
+.strip-bar { background-color: @window_bg_color; }
 .strip-mode { margin: 6px 0 6px 8px; }
+.note-osd { padding: 8px 14px; border-radius: 12px; }
 .strip-mode > button { min-width: 0; min-height: 0; padding: 6px 8px; }
 .video-controls { border-radius: 14px; padding: 4px 10px; }
 .badge { font-size: 0.8em; font-weight: bold; padding: 1px 6px; border-radius: 99px; }
@@ -66,7 +69,7 @@ CSS = b"""
 class Settings:
     DEFAULTS = {"upscale_small": True, "filmstrip": True, "slideshow_seconds": 4,
                 "volume": 100, "mute": False, "loop_video": False, "video_simple": False,
-                "strip_mode": "files"}
+                "strip_mode": "files", "show_notes": True, "unlock_minutes": 0}
 
     def __init__(self):
         self.path = os.path.join(GLib.get_user_config_dir(), "jpgs", "settings.json")
@@ -84,8 +87,10 @@ class Settings:
         self.data[k] = v
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            with open(self.path, "w", encoding="utf-8") as f:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, self.path)  # не оставить полузаписанный файл при сбое
         except OSError:
             pass
 
@@ -462,18 +467,20 @@ class JpgsWindow(Adw.ApplicationWindow):
         s2 = Gio.Menu()
         s2.append("Слайд-шоу", "win.slideshow")
         s2.append("Лента миниатюр", "win.filmstrip")
+        s2.append("Показывать заметки", "win.notes-show")
         s2.append("Растягивать маленькие изображения", "win.upscale")
         s2.append("Повторять видео", "win.loop")
         s2.append("Упрощённый вывод видео (если чёрный экран)", "win.video-simple")
         menu.append_section(None, s2)
         s3 = Gio.Menu()
         s3.append("Зашифровать изображения и видео…", "win.encrypt")
-        s3.append("Объединить .jpgs в один файл…", "win.merge")
+        s3.append("Объединить файлы в один архив…", "win.merge")
         s3.append("Расшифровать все файлы папки…", "win.decrypt-folder")
         s3.append("Сменить ключ у всех файлов папки…", "win.rekey-folder")
         menu.append_section(None, s3)
         s4 = Gio.Menu()
         s4.append("Ключи шифрования…", "app.key")
+        s4.append("Заблокировать (забыть пароль)", "app.lock")
         s4.append("Горячие клавиши", "win.shortcuts")
         s4.append("О программе", "app.about")
         menu.append_section(None, s4)
@@ -550,7 +557,23 @@ class JpgsWindow(Adw.ApplicationWindow):
         self.error_page = Adw.StatusPage(icon_name="dialog-warning-symbolic", visible=False,
                                          title="Не удалось показать изображение", can_target=False)
         self.overlay.add_overlay(self.error_page)
-        self.tv.set_content(self.overlay)
+
+        # заметка к текущей записи — поверх изображения/видео, сверху
+        self.note_label = Gtk.Label(wrap=True, xalign=0, max_width_chars=90, selectable=False,
+                                    css_classes=["osd", "note-osd"])
+        self.note_revealer = Gtk.Revealer(child=self.note_label, halign=Gtk.Align.CENTER,
+                                          valign=Gtk.Align.START, margin_top=12, margin_start=72,
+                                          margin_end=72, can_target=False,
+                                          transition_type=Gtk.RevealerTransitionType.CROSSFADE)
+        self.overlay.add_overlay(self.note_revealer)
+
+        # Лента миниатюр — в основной области окна, а не нижней панелью ToolbarView:
+        # панели ToolbarView обёрнуты в Gtk.WindowHandle, и правый клик по ленте
+        # открывал системное меню окна (свернуть/переместить/закрыть) вместо меню JPGS.
+        self.overlay.set_vexpand(True)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content.append(self.overlay)
+        self.tv.set_content(content)
 
         # --- лента миниатюр
         self.store = Gio.ListStore(item_type=FileItem)
@@ -580,12 +603,18 @@ class JpgsWindow(Adw.ApplicationWindow):
             mode.append(Gtk.ToggleButton(icon_name=icon, tooltip_text=tip, focus_on_click=False,
                                          action_name="win.strip-mode",
                                          action_target=GLib.Variant("s", target)))
-        bar = Gtk.Box()
+        bar = Gtk.Box(css_classes=["strip-bar"])
         bar.append(mode)
         bar.append(sc)
+        # правый клик по пустому месту ленты — ничего (и уж точно не меню оконного менеджера)
+        bar_click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        bar_click.connect("pressed", lambda g, *_: g.set_state(Gtk.EventSequenceState.CLAIMED))
+        bar.add_controller(bar_click)
+        self.strip_popover = Gtk.PopoverMenu(has_arrow=True)
+        self.strip_popover.set_parent(sc)
         self.strip_revealer = Gtk.Revealer(child=bar, reveal_child=False,
                                            transition_type=Gtk.RevealerTransitionType.SLIDE_UP)
-        self.tv.add_bottom_bar(self.strip_revealer)
+        content.append(self.strip_revealer)
 
         drop = Gtk.DropTarget.new(Gdk.FileList.__gtype__, Gdk.DragAction.COPY)
         drop.connect("drop", self._on_drop)
@@ -635,6 +664,18 @@ class JpgsWindow(Adw.ApplicationWindow):
         add("video-frame", self.save_video_frame)
         add("rekey-file", self.rekey_current)
         add("rekey-folder", self.rekey_folder)
+        add("note-edit", self.note_edit)
+        add("transcode", self.transcode_dialog)
+        sn = Gio.SimpleAction.new_stateful("notes-show", None,
+                                           GLib.Variant("b", bool(self.app.settings.get("show_notes"))))
+
+        def toggle_notes(a, _p):
+            v = not a.get_state().get_boolean()
+            a.set_state(GLib.Variant("b", v))
+            self.app.settings.set("show_notes", v)
+            self._update_note()
+        sn.connect("activate", toggle_notes)
+        self.add_action(sn)
         sp = Gio.SimpleAction.new_stateful("speed", GLib.VariantType.new("s"), GLib.Variant("s", "1"))
 
         def set_speed(a, v):
@@ -692,8 +733,43 @@ class JpgsWindow(Adw.ApplicationWindow):
         if a:
             a.set_enabled(on)
 
+    def _file_cipher(self, path: str) -> Optional[Cipher]:
+        """Ключ, которым зашифрован файл (из всех ключей хранилища); иначе — активный."""
+        kr = self.app.keyring
+        if kr is None:
+            return self.cipher
+        return kr.cipher_for(path) or kr.active
+
+    def _is_video_at(self, fi: int, ii: int) -> bool:
+        """Видео ли запись ii файла fi (.vids — всегда; в архиве — по индексу)."""
+        jf = self.files[fi]
+        if jf.is_video:
+            return True
+        try:
+            return jf.kind(ii) == "video"
+        except (OSError, C.ArchiveError):
+            return False
+
     def _cur_is_video(self) -> bool:
-        return bool(self.files) and self.files[self.fi].is_video
+        return bool(self.files) and self._is_video_at(self.fi, self.ii)
+
+    def _set_count(self, fi: int, n: int):
+        """Число записей файла стало известно: обновить ленту и заголовок."""
+        if self.counts.get(fi) == n:
+            return
+        self.counts[fi] = n
+        if self._frames_mode():
+            if self.strip_fi == fi:
+                self._rebuild_strip()
+                if fi == self.fi:
+                    self._sync_strip()
+        else:
+            item = self.store.get_item(fi)
+            if item and not self.files[fi].is_video:
+                item.count = n
+                item.badge = f"×{n}" if n > 1 else ""
+        if fi == self.fi:
+            self._update_strip_visibility()
 
     def _update_actions(self):
         has = bool(self.files)
@@ -707,7 +783,7 @@ class JpgsWindow(Adw.ApplicationWindow):
         for n in ("zoom-in", "zoom-out", "zoom-fit", "zoom-100", "rotate-cw", "rotate-ccw", "copy"):
             self._enable(n, shown)
         self._enable("save-as", shown or is_video)
-        arch = has and not is_video
+        arch = has and not self.files[self.fi].is_video  # архив .jpgs (запись может быть видео)
         n = self.counts.get(self.fi, 1) if has else 1
         self._enable("archive-add", arch and self.cipher is not None)
         self._enable("frame-left", arch and n > 1 and self.ii > 0)
@@ -718,6 +794,8 @@ class JpgsWindow(Adw.ApplicationWindow):
         for a in ("rename", "show-in-folder", "properties"):
             self._enable(a, has)
         self._enable("rekey-file", has)
+        self._enable("note-edit", has)
+        self._enable("transcode", has and (shown or is_video))
         self._enable("rekey-folder", has)
         self._enable("video-frame", is_video)
         self._enable("speed", is_video)
@@ -802,6 +880,13 @@ class JpgsWindow(Adw.ApplicationWindow):
             self.app.require_key(self, lambda: self.open_path(path))
             return
         path = os.path.abspath(path)
+        if os.path.isfile(path) and not path.lower().endswith((".jpgs", ".vids")):
+            # обычная картинка/видео — не «расшифровывать» её, а предложить зашифровать
+            if path.rsplit(".", 1)[-1].lower() in C.IMAGE_EXTS + C.VIDEO_EXTS:
+                self._confirm_encrypt([path])
+            else:
+                self.toast("Это не файл JPGS (.jpgs / .vids)")
+            return
         folder = os.path.dirname(path)
         files = C.list_media(folder)
         if path not in files and os.path.isfile(path):
@@ -815,7 +900,7 @@ class JpgsWindow(Adw.ApplicationWindow):
         self._stop_slideshow()
         self.folder = folder
         self.video.stop()
-        self.files = [C.open_media(p, self.cipher) for p in paths]
+        self.files = [C.open_media(p, self._file_cipher(p)) for p in paths]
         self.counts.clear()
         for i, f in enumerate(self.files):
             if f.is_video:
@@ -859,34 +944,35 @@ class JpgsWindow(Adw.ApplicationWindow):
 
     def _handle_drop(self, paths: list[str]):
         ext = lambda p: p.rsplit(".", 1)[-1].lower()  # noqa: E731
-        jpgs = [p for p in paths if ext(p) == "jpgs"]
-        vids = [p for p in paths if ext(p) == "vids"]
-        videos = [p for p in paths if ext(p) in C.IMAGE_EXTS + C.VIDEO_EXTS and C.is_video_source(p)]
-        imgs = [p for p in paths if ext(p) in C.IMAGE_EXTS and p not in videos]
+        enc = [p for p in paths if ext(p) in ("jpgs", "vids")]
+        plain = [p for p in paths if ext(p) in C.IMAGE_EXTS + C.VIDEO_EXTS]
         cur = self.files[self.fi] if self.files else None
-        if cur is not None and not cur.is_video and (imgs or jpgs) and self.cipher is not None:
-            self._confirm_append(imgs + [p for p in jpgs if p != cur.path], videos)
+        if cur is not None and not cur.is_video and (plain or enc) and self.cipher is not None:
+            # в открытый архив можно дописать и картинки, и видео, и другие .jpgs/.vids
+            self._confirm_append(plain + [p for p in enc if p != cur.path])
             return
-        if jpgs or vids:
-            self.open_path((jpgs + vids)[0])
-        elif imgs or videos:
-            self._confirm_encrypt(imgs + videos)
+        if enc:
+            self.open_path(enc[0])
+        elif plain:
+            self._confirm_encrypt(plain)
 
-    def _confirm_append(self, sources: list[str], videos: list[str]):
+    def _confirm_append(self, sources: list[str]):
         if not sources:
             return
         cur = self.files[self.fi]
         n = len(sources)
-        only_jpgs = all(p.lower().endswith(".jpgs") for p in sources)
+        only_enc = all(p.lower().endswith((".jpgs", ".vids")) for p in sources)
+        has_plain = not all(p.lower().endswith((".jpgs", ".vids")) for p in sources)
         what = plural(n, "файл", "файла", "файлов")
         d = Adw.AlertDialog(
             heading=f"Добавить {what} в «{cur.name}»?",
-            body="Кадры допишутся в конец этого файла — отдельные копии не создаются."
-                 + (f"\nВидео и анимированные GIF ({len(videos)}) в архив картинок не добавить — "
-                    "их можно зашифровать отдельно."
-                    if videos else ""))
+            body="Картинки и видео допишутся в конец этого архива — отдельные копии не создаются. "
+                 "Файлы с другими ключами перешифруются ключом архива."
+                 + ("\n\n«Удалить оригиналы»: после проверки, что всё записалось без ошибок, "
+                    "незашифрованные оригиналы удаляются безвозвратно (не в корзину), "
+                    "зашифрованные — в корзину." if has_plain else ""))
         d.add_response("cancel", "Отмена")
-        if only_jpgs:
+        if only_enc:
             d.add_response("open", "Открыть")
         d.add_response("add_trash", "Добавить и удалить оригиналы")
         d.add_response("add", "Добавить")
@@ -900,22 +986,23 @@ class JpgsWindow(Adw.ApplicationWindow):
                 self.open_path(sources[0])
             elif r in ("add", "add_trash"):
                 self.append_to_current(sources, trash=(r == "add_trash"))
-                if videos:
-                    self._confirm_encrypt(videos)
         d.connect("response", resp)
         d.present(self)
 
     # ---------------------------------------------------------------- архив (.jpgs)
 
     def _cur_archive(self):
-        if not self.files or self._cur_is_video():
+        """Текущий архив .jpgs (запись в нём может быть и видео) или None для .vids."""
+        if not self.files or self.files[self.fi].is_video:
             return None
         return self.files[self.fi]
 
     def _file_changed(self, fi: int, goto_ii: int = 0):
         """Файл на диске изменился: сбросить кэши и показать нужный кадр."""
         jf = self.files[fi]
-        jf._ranges = None
+        jf.invalidate()
+        if self.app.keyring is not None:
+            self.app.keyring.forget(jf.path)
         self.counts.pop(fi, None)
         for k in [k for k in self.tex_cache if k[0] == fi]:
             del self.tex_cache[k]
@@ -959,17 +1046,23 @@ class JpgsWindow(Adw.ApplicationWindow):
         fi = self.fi
         before = self.counts.get(fi) or jf.count()
 
-        def work():
-            return C.append_frames(jf.path, sources, self.cipher)
+        keys = self.app.keyring or jf.cipher
+        prog = self._progress_toast() if sum(_size(p) for p in sources) > 32 << 20 else None
 
-        def done(n):
+        def work():
+            n = C.append_frames(jf.path, sources, jf.cipher, keys, prog)
+            removed = 0
+            if trash and C.verify_import(jf.path, jf.cipher, before, sources, keys):
+                removed = _dispose_originals(sources)
+            return n, removed
+
+        def done(res):
+            n, removed = res
+            msg = f"Добавлено записей: {n}"
             if trash:
-                for p in sources:
-                    try:
-                        Gio.File.new_for_path(p).trash(None)
-                    except GLib.Error:
-                        pass
-            self.toast(f"Добавлено кадров: {n}")
+                msg += (f" · оригиналы удалены: {removed}" if removed
+                        else " · оригиналы НЕ удалены: проверка не прошла")
+            self.toast(msg)
             if trash and any(os.path.dirname(p) == self.folder for p in sources):
                 self._reload_folder(jf.path, before)
             else:
@@ -979,9 +1072,9 @@ class JpgsWindow(Adw.ApplicationWindow):
     def archive_add_dialog(self):
         if self._cur_archive() is None:
             return
-        dlg = Gtk.FileDialog(title="Добавить изображения в этот файл")
-        f = Gtk.FileFilter(name="Изображения и .jpgs")
-        for e in C.IMAGE_EXTS + ("jpgs",):
+        dlg = Gtk.FileDialog(title="Добавить в этот архив")
+        f = Gtk.FileFilter(name="Изображения, видео, .jpgs, .vids")
+        for e in C.IMAGE_EXTS + C.VIDEO_EXTS + ("jpgs", "vids"):
             f.add_pattern(f"*.{e}")
             f.add_pattern(f"*.{e.upper()}")
         store = Gio.ListStore(item_type=Gtk.FileFilter)
@@ -994,8 +1087,7 @@ class JpgsWindow(Adw.ApplicationWindow):
             except GLib.Error:
                 return
             paths = [p for p in (files.get_item(i).get_path() for i in range(files.get_n_items())) if p]
-            anim = [p for p in paths if C.is_animated_gif(p)]
-            self._confirm_append([p for p in paths if p not in anim], anim)
+            self._confirm_append(paths)
         dlg.open_multiple(self, None, done)
 
     def _frames_op(self, label, func, goto):
@@ -1014,7 +1106,7 @@ class JpgsWindow(Adw.ApplicationWindow):
             return
         order = list(range(n))
         order[i], order[j] = order[j], order[i]
-        self._frames_op("Перемещение кадра…", lambda: C.rewrite_frames(jf.path, order, self.cipher), j)
+        self._frames_op("Перемещение кадра…", lambda: C.rewrite_frames(jf.path, order, jf.cipher), j)
 
     def frame_goto(self):
         """Переместить текущий кадр на введённый номер (1..n); остальные сдвигаются."""
@@ -1048,7 +1140,7 @@ class JpgsWindow(Adw.ApplicationWindow):
             f = order.pop(i)
             order.insert(target, f)
             self._frames_op("Перемещение кадра…",
-                            lambda: C.rewrite_frames(jf.path, order, self.cipher), target)
+                            lambda: C.rewrite_frames(jf.path, order, jf.cipher), target)
         d.connect("response", resp)
         d.present(self)
         _focus_later(spin, select_all=True)
@@ -1067,7 +1159,7 @@ class JpgsWindow(Adw.ApplicationWindow):
         d.set_close_response("cancel")
         order = [k for k in range(n) if k != i]
         d.connect("response", lambda _d, r: r == "del" and self._frames_op(
-            "Удаление кадра…", lambda: C.rewrite_frames(jf.path, order, self.cipher), min(i, n - 2)))
+            "Удаление кадра…", lambda: C.rewrite_frames(jf.path, order, jf.cipher), min(i, n - 2)))
         d.present(self)
 
     def frame_extract(self):
@@ -1079,8 +1171,8 @@ class JpgsWindow(Adw.ApplicationWindow):
         i = self.ii
 
         def work():
-            out = C.extract_frames(jf.path, [i], self.cipher)
-            C.rewrite_frames(jf.path, [k for k in range(n) if k != i], self.cipher)
+            out = C.extract_frames(jf.path, [i], jf.cipher)
+            C.rewrite_frames(jf.path, [k for k in range(n) if k != i], jf.cipher)
             return out
 
         def done(out):
@@ -1094,7 +1186,8 @@ class JpgsWindow(Adw.ApplicationWindow):
         if jf is None or n < 2:
             return
         d = Adw.AlertDialog(heading=f"Разделить «{jf.name}» на {n} файлов?",
-                            body="Каждый кадр станет отдельным .jpgs, исходный файл уйдёт в корзину.")
+                            body="Каждая запись станет отдельным файлом (картинки — .jpgs, видео — .vids), "
+                 "исходный файл уйдёт в корзину.")
         d.add_response("cancel", "Отмена")
         d.add_response("split", "Разделить")
         d.set_response_appearance("split", Adw.ResponseAppearance.SUGGESTED)
@@ -1105,7 +1198,7 @@ class JpgsWindow(Adw.ApplicationWindow):
                 return
 
             def work():
-                out = C.extract_frames(jf.path, list(range(n)), self.cipher)
+                out = C.extract_frames(jf.path, list(range(n)), jf.cipher)
                 Gio.File.new_for_path(jf.path).trash(None)
                 return out
             self.run_bg("Разделение…", work,
@@ -1174,7 +1267,11 @@ class JpgsWindow(Adw.ApplicationWindow):
         except OSError:
             size = 0
         lines = [f"Папка: {os.path.dirname(jf.path)}", f"Размер: {human_size(size)}"]
-        if jf.is_video:
+        kr = self.app.keyring
+        if kr is not None:
+            c = kr.cipher_for(jf.path)
+            lines.append(f"Ключ: {kr.name_of(c) if c else 'не подходит ни один'}")
+        if self._cur_is_video():
             vp = self.video.props
             if vp.get("width"):
                 lines.append(f"Видео: {vp.get('width')}×{vp.get('height')}")
@@ -1189,7 +1286,17 @@ class JpgsWindow(Adw.ApplicationWindow):
                 lines.append(f"Разрешение кадра: {self.view.iw}×{self.view.ih}")
             b = self.bytes_cache.get((jf.path, self.ii))
             if b:
-                lines.append(f"Размер кадра (JPEG): {human_size(len(b))}")
+                lines.append(f"Размер кадра: {human_size(len(b))}")
+        if jf.is_video or jf.indexed:
+            try:
+                e = jf.entry(max(0, self.ii))
+                if not jf.is_video:
+                    lines.append(f"Запись {self.ii + 1}: {'видео' if e.is_video else 'изображение'}"
+                                 f" {e.ext}, {human_size(e.length)}")
+                if e.note:
+                    lines.append(f"Заметка: {e.note}")
+            except (IndexError, OSError, C.ArchiveError):
+                pass
         d = Adw.AlertDialog(heading=jf.name, body="\n".join(lines))
         d.set_body_use_markup(False)
         d.add_response("ok", "Закрыть")
@@ -1210,14 +1317,15 @@ class JpgsWindow(Adw.ApplicationWindow):
                 return
             if not dest.lower().endswith(".png"):
                 dest += ".png"
-            self._do_save_video_frame(jf.path, t, dest)
+            entry = None if jf.is_video else jf.entry(self.ii)
+            self._do_save_video_frame(jf, t, dest, entry)
         dlg.save(self, None, picked)
 
-    def _do_save_video_frame(self, path, t, dest):
+    def _do_save_video_frame(self, jf, t, dest, entry=None):
         """Декодируем кадр через PyAV (надёжно при hwdec); если PyAV нет — screenshot mpv."""
         def work():
             from .video import save_frame_png
-            save_frame_png(path, self.cipher, t, dest)
+            save_frame_png(jf.path, jf.cipher, t, dest, entry)
             return dest
 
         def done(p):
@@ -1236,6 +1344,200 @@ class JpgsWindow(Adw.ApplicationWindow):
             return
         self.run_bg("Сохранение кадра…", work, done)
 
+    # ---------------------------------------------------------------- FFmpeg: сжатие/конвертация
+
+    def transcode_dialog(self):
+        """Сжать или сконвертировать текущую картинку/видео через FFmpeg (без расшифровки на диск)."""
+        if not self.files:
+            return
+        from . import transcode as T
+        if not T.ffmpeg_path():
+            self.toast("Нужен FFmpeg: установите пакет ffmpeg")
+            return
+        jf, fi = self.files[self.fi], self.fi
+        ii = max(0, self._resolve(fi, self.ii))
+        video = self._cur_is_video()
+        d = Adw.Dialog(title="Сжать / конвертировать", content_width=460)
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(Adw.HeaderBar())
+        page = Adw.PreferencesPage()
+        grp = Adw.PreferencesGroup(
+            description="Расшифрованные данные не попадают на диск: FFmpeg читает их из памяти "
+                        "программы, результат сразу шифруется тем же ключом.")
+        page.add(grp)
+
+        def combo(title, items, sel=0, subtitle=None):
+            row = Adw.ComboRow(title=title, model=Gtk.StringList.new([t for _v, t in items]))
+            if subtitle:
+                row.set_subtitle(subtitle)
+            row.set_selected(sel)
+            grp.add(row)
+            return lambda: items[row.get_selected()][0]
+
+        if video:
+            fmts = [(f, T.VIDEO_FORMAT_LABELS[f]) for f in T.available_video_formats()]
+            g_fmt = combo("Формат", fmts)
+            g_q = combo("Качество", [(q, T.QUALITY_LABELS[q]) for q in T.QUALITY], 1)
+            heights = [(None, "Исходное"), (2160, "2160p (4K)"), (1440, "1440p"), (1080, "1080p"),
+                       (720, "720p"), (480, "480p"), (360, "360p"), (240, "240p")]
+            g_h = combo("Разрешение (не больше)", heights)
+            rates = [(None, "Исходная"), (60, "60"), (30, "30"), (25, "25"), (24, "24"),
+                     (15, "15"), (10, "10"), (5, "5")]
+            g_fps = combo("Кадров в секунду", rates)
+            audio = Adw.SwitchRow(title="Звук", active=True)
+            grp.add(audio)
+            t0 = Adw.EntryRow(title="Начало (мм:сс, пусто — с начала)")
+            t1 = Adw.EntryRow(title="Конец (мм:сс, пусто — до конца)")
+            grp.add(t0)
+            grp.add(t1)
+        else:
+            fmts = [(f, {"jpg": "JPEG", "png": "PNG (без потерь)", "webp": "WebP"}[f])
+                    for f in T.available_image_formats()]
+            g_fmt = combo("Формат", fmts)
+            qrow = Adw.SpinRow.new_with_range(1, 100, 1)
+            qrow.set_title("Качество (JPEG, WebP)")
+            qrow.set_value(85)
+            grp.add(qrow)
+            sides = [(None, "Исходный"), (3840, "3840"), (2560, "2560"), (1920, "1920"),
+                     (1280, "1280"), (800, "800"), (400, "400")]
+            g_side = combo("Длинная сторона (не больше), пикс.", sides)
+        g_dest = combo("Результат", [(True, "Заменить оригинал"),
+                                     (False, "Сохранить новым файлом рядом")])
+        go = Gtk.Button(label="Начать", css_classes=["pill", "suggested-action"],
+                        halign=Gtk.Align.CENTER, margin_top=12, margin_bottom=12)
+        bottom = Adw.PreferencesGroup()
+        bottom.add(go)
+        page.add(bottom)
+        tv.set_content(page)
+        d.set_child(tv)
+
+        def start(_b):
+            try:
+                if video:
+                    o = T.VideoOpts(fmt=g_fmt(), quality=g_q(), max_height=g_h(), fps=g_fps(),
+                                    audio=audio.get_active(), start=T.parse_time(t0.get_text()),
+                                    end=T.parse_time(t1.get_text()))
+                    T.video_args(o)  # проверка параметров (например, конец раньше начала)
+                else:
+                    o = T.ImageOpts(fmt=g_fmt(), quality=int(qrow.get_value()), max_side=g_side())
+            except (ValueError, T.TranscodeError) as e:
+                self.toast(f"Неверные параметры: {e}")
+                return
+            replace = g_dest()
+            d.close()
+            self._run_transcode(jf, fi, ii, video, o, replace)
+        go.connect("clicked", start)
+        d.present(self)
+
+    def _run_transcode(self, jf, fi, ii, video, o, replace):
+        from . import transcode as T
+        job = T.Job()
+        toast = Adw.Toast(title="Конвертация…", timeout=0, button_label="Отмена")
+        toast.connect("button-clicked", lambda *_: job.cancel())
+        self.toasts.add_toast(toast)
+        last = {"pct": -2}
+
+        def prog(frac):
+            pct = int(frac * 100) if frac >= 0 else -1
+            if pct != last["pct"]:
+                last["pct"] = pct
+                GLib.idle_add(lambda: toast.set_title(
+                    f"Конвертация… {pct}%" if pct >= 0 else "Конвертация…") and False)
+        if replace and video:
+            self.video.stop()  # файл будет заменён
+
+        def work():
+            if video:
+                return T.transcode_video(jf, ii, o, replace, job, prog)
+            return T.transcode_image(jf, ii, o, replace, job, prog)
+
+        def job_thread():
+            try:
+                res, err = work(), None
+            except Exception as e:  # noqa: BLE001
+                res, err = None, e
+            GLib.idle_add(lambda: finished(res, err) and False)
+
+        def finished(res, err):
+            toast.dismiss()
+            if err is not None:
+                if not job.cancelled and not isinstance(err, T.TranscodeError):
+                    traceback.print_exception(err)
+                self.toast(f"Не удалось: {err}" if not job.cancelled else "Конвертация отменена")
+                if replace and fi < len(self.files):
+                    self._file_changed(fi, ii)
+                return
+            self.toast(f"Готово: {human_size(res.before)} → {human_size(res.after)}"
+                       + ("" if res.replaced else f" · {os.path.basename(res.path)}"))
+            if res.replaced:
+                self._file_changed(fi, ii)
+            else:
+                self._reload_folder(jf.path, ii)
+        threading.Thread(target=job_thread, daemon=True).start()
+
+    # ---------------------------------------------------------------- заметки
+
+    def _current_note(self) -> str:
+        if not self.files:
+            return ""
+        jf = self.files[self.fi]
+        try:
+            if jf.is_video or jf.indexed or C.has_index(jf.path):
+                return jf.note(max(0, self._resolve(self.fi, self.ii)))
+        except (OSError, IndexError, C.ArchiveError):
+            pass
+        return ""
+
+    def _update_note(self):
+        text = self._current_note() if self.app.settings.get("show_notes") else ""
+        if text and self._current_error is None:
+            self.note_label.set_text(text)
+            self.note_revealer.set_reveal_child(True)
+        else:
+            self.note_revealer.set_reveal_child(False)
+
+    def note_edit(self):
+        """Заметка к текущей картинке или видео (хранится зашифрованной в самом файле)."""
+        if not self.files:
+            return
+        jf, fi = self.files[self.fi], self.fi
+        ii = max(0, self._resolve(fi, self.ii))
+        cur = self._current_note()
+        buf = Gtk.TextBuffer(text=cur)
+        tv = Gtk.TextView(buffer=buf, wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=8,
+                          bottom_margin=8, left_margin=8, right_margin=8)
+        sw = Gtk.ScrolledWindow(child=tv, min_content_height=160, min_content_width=380,
+                                css_classes=["card"])
+        what = "видео" if self._cur_is_video() else "изображению"
+        d = Adw.AlertDialog(heading="Заметка",
+                            body=f"Заметка к {what}. Хранится в файле в зашифрованном виде.")
+        d.set_extra_child(sw)
+        d.add_response("cancel", "Отмена")
+        if cur:
+            d.add_response("delete", "Удалить")
+            d.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        d.add_response("save", "Сохранить")
+        d.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        d.set_close_response("cancel")
+
+        def resp(_d, r):
+            if r not in ("save", "delete"):
+                return
+            text = "" if r == "delete" else buf.get_text(buf.get_start_iter(),
+                                                          buf.get_end_iter(), False)
+            if text.strip() == cur.strip():
+                return
+            if self._cur_is_video():
+                self.video.stop()  # файл будет дописан или пересобран
+
+            def done(_r):
+                self.toast("Заметка удалена" if not text.strip() else "Заметка сохранена")
+                self._file_changed(fi, ii)
+            self.run_bg("Сохранение заметки…", lambda: C.set_note(jf.path, ii, text, jf.cipher), done)
+        d.connect("response", resp)
+        d.present(self)
+        _focus_later(tv)
+
     # ---------------------------------------------------------------- смена ключа файлов
 
     def rekey_current(self):
@@ -1243,6 +1545,12 @@ class JpgsWindow(Adw.ApplicationWindow):
             return
         jf = self.files[self.fi]
         fi, ii = self.fi, self.ii
+        kr = self.app.keyring
+        old = kr.cipher_for(jf.path) if kr else jf.cipher
+        if old is None:
+            # перешифровать «не тем» ключом — значит испортить файл; не даём
+            self.toast("Ни один ключ не подходит к этому файлу — сменить ключ нельзя")
+            return
 
         def choose(kid):
             from .keystore import get_keystore
@@ -1251,92 +1559,71 @@ class JpgsWindow(Adw.ApplicationWindow):
             except (KeyError, KeyMissing):
                 self.toast("Ключ не найден")
                 return
-            old = self.cipher
-            self.run_bg(
-                "Смена ключа…",
-                lambda: (C.reencrypt_media(jf.path, old, new,
-                                           self._progress_toast() if jf.is_video else None), kid)[1],
-                lambda k: self._after_rekey(k, jf.path, fi, ii))
+            prog = self._progress_toast() if _size(jf.path) > 32 << 20 else None
+
+            def done(_r):
+                jf.cipher = new
+                self.toast(f"Файл перешифрован ключом «{kr.name_of(new) if kr else kid}»")
+                self._file_changed(fi, ii)
+            self.run_bg("Смена ключа…", lambda: C.reencrypt_media(jf.path, old, new, prog), done)
         keys_ui.choose_key_dialog(
             self.app, self, "Сменить ключ файла",
-            f"Выберите ключ, которым перешифровать «{jf.name}».", choose, exclude_active=True)
+            f"Выберите ключ, которым перешифровать «{jf.name}».", choose,
+            exclude_material=old.material)
 
     def rekey_folder(self):
         if not self.files or not self.folder:
             return
         keys_ui.choose_key_dialog(
             self.app, self, "Сменить ключ у всех файлов папки",
-            f"Файлы в «{os.path.basename(self.folder)}» будут перешифрованы выбранным ключом. "
-            "Файлы, зашифрованные другим ключом, пропускаются.",
-            self.rekey_folder_to, exclude_active=True)
+            f"Все файлы в «{os.path.basename(self.folder)}» будут перешифрованы выбранным "
+            "ключом — каждый со своего текущего ключа. Файлы, к которым не подходит ни один "
+            "ключ, пропускаются.",
+            self.rekey_folder_to)
 
     def rekey_folder_to(self, kid):
         """Перешифровать все файлы текущей папки ключом kid (без диалога выбора)."""
         if not self.files or not self.folder:
             return
         paths = [f.path for f in self.files]
-
-        def run():
-            from .keystore import get_keystore
-            try:
-                new = Cipher(material=get_keystore().material_by_id(kid))
-            except (KeyError, KeyMissing):
-                self.toast("Ключ не найден")
-                return
-            old = self.cipher
-
-            def work():
-                ok, skipped = 0, 0
-                for p in paths:
-                    if not C.verify_media(p, old):
-                        skipped += 1
-                        continue
-                    try:
-                        C.reencrypt_media(p, old, new)
-                        ok += 1
-                    except Exception:  # noqa: BLE001
-                        skipped += 1
-                return kid, ok, skipped
-
-            def done(res):
-                k, ok, skipped = res
-                msg = f"Перешифровано файлов: {ok}"
-                if skipped:
-                    msg += f", пропущено (другой ключ): {skipped}"
-                self.toast(msg)
-                cur = self.files[self.fi].path if self.files else None
-                self._after_rekey(k, cur, self.fi, self.ii, reload_only=(ok == 0))
-            self.run_bg("Смена ключа у файлов…", work, done)
-        run()
-
-    def _after_rekey(self, kid, reload_path, fi, ii, reload_only=False):
+        kr = self.app.keyring
         from .keystore import get_keystore
-        ks = get_keystore()
-        if reload_only or ks.active_id() == kid:
-            self._file_changed(fi, ii)
+        try:
+            new = Cipher(material=get_keystore().material_by_id(kid))
+        except (KeyError, KeyMissing):
+            self.toast("Ключ не найден")
             return
-        name = next((e["name"] for e in ks.entries() if e["id"] == kid), "новым ключом")
-        d = Adw.AlertDialog(
-            heading="Сделать этот ключ активным?",
-            body=f"Файлы перешифрованы ключом «{name}». Чтобы открывать их, сделайте его активным.")
-        d.add_response("later", "Позже")
-        d.add_response("switch", "Сделать активным")
-        d.set_response_appearance("switch", Adw.ResponseAppearance.SUGGESTED)
-        d.set_default_response("switch")
-        d.set_close_response("later")
 
-        def resp(_d, r):
-            if r != "switch":
-                return
-            ks.set_active(kid)
-            try:
-                self.app.cipher = Cipher()
-            except Exception:  # noqa: BLE001
-                pass
-            if reload_path:
-                self.open_path(reload_path)
-        d.connect("response", resp)
-        d.present(self)
+        def work():
+            ok, same, skipped = 0, 0, 0
+            for p in paths:
+                old = kr.cipher_for(p) if kr else None
+                if old is None:
+                    skipped += 1
+                    continue
+                if old == new:
+                    same += 1
+                    continue
+                try:
+                    C.reencrypt_media(p, old, new)
+                    ok += 1
+                except Exception:  # noqa: BLE001
+                    traceback.print_exc()
+                    skipped += 1
+            return ok, same, skipped
+
+        def done(res):
+            ok, same, skipped = res
+            msg = f"Перешифровано файлов: {ok}"
+            if same:
+                msg += f", уже с этим ключом: {same}"
+            if skipped:
+                msg += f", пропущено (ключ не подходит): {skipped}"
+            self.toast(msg)
+            cur = self.files[self.fi].path if self.files else None
+            if cur:
+                self._reload_folder(cur, self.ii)
+        self.run_bg("Смена ключа у файлов…", work, done)
 
     # ---------------------------------------------------------------- контекстное меню
 
@@ -1357,7 +1644,7 @@ class JpgsWindow(Adw.ApplicationWindow):
     def _build_context_menu(self) -> Gio.Menu:
         jf = self.files[self.fi]
         menu = Gio.Menu()
-        if jf.is_video:
+        if self._cur_is_video():
             s = Gio.Menu()
             s.append("Пауза / воспроизведение", "win.play-pause")
             speed = Gio.Menu()
@@ -1368,27 +1655,32 @@ class JpgsWindow(Adw.ApplicationWindow):
             s.append("Звук вкл/выкл", "win.mute")
             menu.append_section("Видео", s)
             s2 = Gio.Menu()
+            s2.append("Заметка…", "win.note-edit")
+            s2.append("Сжать / конвертировать…", "win.transcode")
             s2.append("Сохранить текущий кадр как PNG…", "win.video-frame")
             s2.append("Сохранить расшифрованную копию…", "win.save-as")
             menu.append_section(None, s2)
         else:
             s = Gio.Menu()
+            s.append("Заметка…", "win.note-edit")
             s.append("Копировать изображение", "win.copy")
             s.append("Сохранить расшифрованную копию…", "win.save-as")
+            s.append("Сжать / конвертировать…", "win.transcode")
             s.append("Повернуть по часовой", "win.rotate-cw")
             s.append("Повернуть против часовой", "win.rotate-ccw")
             s.append("Вписать в окно", "win.zoom-fit")
             s.append("Исходный размер (100%)", "win.zoom-100")
             menu.append_section("Изображение", s)
+        if not jf.is_video:
             n = self.counts.get(self.fi, 1)
             a = Gio.Menu()
-            a.append("Добавить изображения в этот файл…", "win.archive-add")
+            a.append("Добавить картинки или видео в этот архив…", "win.archive-add")
             if n > 1:
-                a.append("Переместить кадр на номер…", "win.frame-goto")
-                a.append("Вынести кадр в отдельный файл", "win.frame-extract")
-                a.append("Удалить кадр из файла", "win.frame-delete")
+                a.append("Переместить запись на номер…", "win.frame-goto")
+                a.append("Вынести запись в отдельный файл", "win.frame-extract")
+                a.append("Удалить запись из архива", "win.frame-delete")
                 a.append("Разделить на отдельные файлы", "win.archive-split")
-            title = f"Архив · кадр {self.ii + 1} из {n}" if n > 1 else "Архив"
+            title = f"Архив · запись {self.ii + 1} из {n}" if n > 1 else "Архив"
             menu.append_section(title, a)
         f = Gio.Menu()
         f.append("Переименовать…", "win.rename")
@@ -1442,8 +1734,14 @@ class JpgsWindow(Adw.ApplicationWindow):
         if not self.files:
             return
         self._current_error = None
-        if self.files[fi].is_video:
-            self._show_video(fi)
+        jf = self.files[fi]
+        if fi not in self.counts and (jf.is_video or jf.indexed or C.has_index(jf.path)):
+            try:
+                self._set_count(fi, jf.count())  # индекс v2 читается быстро — без фона
+            except (OSError, C.ArchiveError):
+                pass
+        if self._is_video_at(fi, ii):
+            self._show_video(fi, ii)
             return
         if self.stack.get_visible_child_name() == "video":
             self.video.stop()
@@ -1466,9 +1764,12 @@ class JpgsWindow(Adw.ApplicationWindow):
             self._arm_spinner()
         self._sync_strip()
         self._update_title()
+        self._update_note()
 
-    def _show_video(self, fi):
-        self.fi, self.ii = fi, 0
+    def _show_video(self, fi, ii=0):
+        jf = self.files[fi]
+        ii = max(0, self._resolve(fi, ii))
+        self.fi, self.ii = fi, ii
         self._stop_spinner()
         self.status.set_visible(False)
         self.error_page.set_visible(False)
@@ -1484,8 +1785,16 @@ class JpgsWindow(Adw.ApplicationWindow):
         if sp is not None:
             sp.set_state(GLib.Variant("s", "1"))
             self.video._set("speed", "1")
-        if not self.video.play(self.files[fi].path):
-            self._video_error(self.video.error or "Видео недоступно")
+        try:
+            entry = None if jf.is_video else jf.entry(ii)
+            ext = jf.video_ext(ii)
+        except (OSError, IndexError, C.ArchiveError) as e:
+            entry, ext = None, ""
+            self._video_error(f"Не удалось прочитать видео: {e}")
+        else:
+            if not self.video.play(jf.path, jf.cipher, entry, ext):
+                self._video_error(self.video.error or "Видео недоступно")
+        self._update_note()
         self._sync_strip()
         self._update_title()
         self._update_actions()
@@ -1515,6 +1824,7 @@ class JpgsWindow(Adw.ApplicationWindow):
         self._stop_spinner()
         self._update_title()
         self._update_actions()
+        self._update_note()
         self._prefetch()
 
     def _prefetch(self):
@@ -1564,7 +1874,7 @@ class JpgsWindow(Adw.ApplicationWindow):
 
     def _request(self, fi, ii, full):
         tag = (fi, ii, full)
-        if tag in self.inflight or self.files[fi].is_video:
+        if tag in self.inflight or self._is_video_at(fi, ii):
             return
         self.inflight.add(tag)
         jf = self.files[fi]
@@ -1582,6 +1892,9 @@ class JpgsWindow(Adw.ApplicationWindow):
             if n == 0:
                 raise DecodeError("В файле нет изображений (неверный ключ или файл повреждён)")
             rii = n - 1 if ii < 0 else min(ii, n - 1)
+            if jf.kind(rii) == "video":  # выяснилось после подсчёта записей — показать плеер
+                GLib.idle_add(self._job_video, files_ref, fi, ii, rii, n, full)
+                return
             data = self._get_bytes(jf, rii)
             dec = decode(data, max_side)
         except Exception as e:  # noqa: BLE001
@@ -1591,23 +1904,21 @@ class JpgsWindow(Adw.ApplicationWindow):
             return
         GLib.idle_add(self._job_done, files_ref, fi, ii, rii, n, dec, full)
 
+    def _job_video(self, files_ref, fi, ii_req, ii, n, full):
+        self.inflight.discard((fi, ii_req, full))
+        if files_ref is not self.files:
+            return False
+        self._set_count(fi, n)
+        current = self.fi == fi and (self.ii == ii or (self.ii < 0 and ii == n - 1))
+        if current and not full:
+            self.show(fi, ii)
+        return False
+
     def _job_done(self, files_ref, fi, ii_req, ii, n, dec, full):
         self.inflight.discard((fi, ii_req, full))
         if files_ref is not self.files:
             return False
-        if self.counts.get(fi) != n:
-            self.counts[fi] = n
-            if self._frames_mode():
-                if self.strip_fi == fi:
-                    self._rebuild_strip()
-                    self._sync_strip()
-            else:
-                item = self.store.get_item(fi)
-                if item:
-                    item.count = n
-                    item.badge = f"×{n}" if n > 1 else ""
-            if fi == self.fi:
-                self._update_strip_visibility()
+        self._set_count(fi, n)
         if fi not in self.relevant:
             return False
         tex = dec.texture()
@@ -1633,9 +1944,15 @@ class JpgsWindow(Adw.ApplicationWindow):
             self._stop_spinner()
             self._current_error = str(err)
             self.view.clear()
+            kr = self.app.keyring
+            if kr is not None and kr.cipher_for(self.files[fi].path) is None:
+                why = ("Ни один из ваших ключей не подходит к этому файлу. Добавьте ключ, "
+                       "которым он зашифрован («Ключи шифрования…»).")
+            else:
+                why = ("Файл повреждён. Можно попробовать «jpgs recovery» в папке с файлом.")
             self.error_page.set_description(
-                "Неверный ключ или файл повреждён.\nМожно попробовать «jpgs recovery» в папке с файлом."
-                f"\n\n<small>{GLib.markup_escape_text(str(err))}</small>")
+                f"{why}\n\n<small>{GLib.markup_escape_text(str(err))}</small>")
+            self._update_note()
             self.error_page.set_visible(True)
             self._update_title()
             self._update_actions()
@@ -1676,8 +1993,11 @@ class JpgsWindow(Adw.ApplicationWindow):
             return
         jf = self.files[self.fi]
         parts = [f"{self.fi + 1} из {len(self.files)}"]
-        if jf.is_video:
+        if self._cur_is_video():
             vp = self.video.props
+            n = self.counts.get(self.fi)
+            if not jf.is_video and n and n > 1:
+                parts.append(f"запись {self.ii + 1}/{n}")
             parts.append("видео")
             if vp.get("width") and vp.get("height"):
                 w_, h_ = vp["width"], vp["height"]
@@ -1714,7 +2034,10 @@ class JpgsWindow(Adw.ApplicationWindow):
                           valign=Gtk.Align.END, margin_end=4, margin_bottom=4, visible=False)
         ov.set_child(pic)
         ov.add_overlay(badge)
-        ov.pic, ov.badge, ov.handlers = pic, badge, []
+        ov.pic, ov.badge, ov.handlers, ov.li = pic, badge, [], li
+        rc = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        rc.connect("pressed", self._thumb_menu, ov)
+        ov.add_controller(rc)
         li.set_child(ov)
 
     def _thumb_bind(self, fac, li):
@@ -1745,6 +2068,23 @@ class JpgsWindow(Adw.ApplicationWindow):
                 self.thumb_queue.remove(item)
                 self.thumb_pending.discard(item.index)
 
+    def _thumb_menu(self, gesture, n, x, y, ov):
+        """Правый клик по миниатюре: открыть эту запись и показать меню JPGS для неё."""
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        pos = ov.li.get_position()
+        if pos == Gtk.INVALID_LIST_POSITION or not self.files:
+            return
+        if pos != self._strip_pos():
+            self.sel.set_selected(pos)  # → _on_strip_selected → show()
+        ok, pt = ov.compute_point(self.strip_sw, Graphene.Point().init(x, y))
+        rect = Gdk.Rectangle()
+        rect.x, rect.y = (int(pt.x), int(pt.y)) if ok else (0, 0)
+        rect.width = rect.height = 1
+        self.strip_popover.set_menu_model(self._build_context_menu())
+        self.strip_popover.set_pointing_to(rect)
+        self._update_actions()
+        self.strip_popover.popup()
+
     @staticmethod
     def _set_badge(ov, text):
         ov.badge.set_visible(bool(text))
@@ -1766,12 +2106,15 @@ class JpgsWindow(Adw.ApplicationWindow):
         try:
             if files_ref is not self.files or item.gen != self.strip_gen:
                 return
-            if item.jf.is_video:
+            jf = item.jf
+            k = item.ii if item.ii is not None else 0
+            if jf.is_video or jf.kind(k) == "video":
                 from .video import frame_pixbuf
-                pb, info = frame_pixbuf(item.jf.path, self.cipher, THUMB_SIDE)
+                entry = None if jf.is_video else jf.entry(k)
+                pb, info = frame_pixbuf(jf.path, jf.cipher, THUMB_SIDE, entry=entry)
                 GLib.idle_add(self._video_thumb_done, files_ref, item, pb, info)
                 return
-            data = item.jf.read_first() if item.ii is None else item.jf.read_image(item.ii)
+            data = jf.read_first() if item.ii is None else jf.read_image(item.ii)
             if not data:
                 raise DecodeError("пусто")
             dec = decode(data, THUMB_SIDE)
@@ -1779,8 +2122,8 @@ class JpgsWindow(Adw.ApplicationWindow):
             def failed():
                 if item.gen == self.strip_gen:
                     self.thumb_pending.discard(item.index)
-                    if item.jf.is_video:
-                        item.badge = "▶"
+                    if item.jf.is_video or (item.ii is not None and item.jf.kind(item.ii) == "video"):
+                        item.badge = self._frame_badge(item, "▶")
                 return False
             GLib.idle_add(failed)
             return
@@ -1793,7 +2136,8 @@ class JpgsWindow(Adw.ApplicationWindow):
         fmt = Gdk.MemoryFormat.R8G8B8A8 if pb.get_has_alpha() else Gdk.MemoryFormat.R8G8B8
         item.thumb = Gdk.MemoryTexture.new(pb.get_width(), pb.get_height(), fmt,
                                            pb.read_pixel_bytes(), pb.get_rowstride())
-        item.badge = "▶ " + fmt_time(info.duration) if info.duration else "▶"
+        play = "▶ " + fmt_time(info.duration) if info.duration else "▶"
+        item.badge = self._frame_badge(item, play)
         with self.thumb_lock:
             self.thumb_lru[item.index] = item
             while len(self.thumb_lru) > THUMB_LIMIT:
@@ -1807,7 +2151,7 @@ class JpgsWindow(Adw.ApplicationWindow):
         self.thumb_pending.discard(item.index)
         item.thumb = dec.texture()
         if item.ii is not None:
-            item.badge = str(item.ii + 1)
+            item.badge = self._frame_badge(item, "")
         with self.thumb_lock:
             self.thumb_lru[item.index] = item
             self.thumb_lru.move_to_end(item.index)
@@ -1822,6 +2166,21 @@ class JpgsWindow(Adw.ApplicationWindow):
             return self.fi
         ii = self._resolve(self.fi, self.ii)
         return ii if 0 <= ii < self.store.get_n_items() else Gtk.INVALID_LIST_POSITION
+
+    @staticmethod
+    def _frame_badge(item, extra: str) -> str:
+        """Подпись миниатюры: номер кадра (в режиме «кадры»), ▶ длительность, ✎ — есть заметка."""
+        parts = []
+        if item.ii is not None:
+            parts.append(str(item.ii + 1))
+        if extra:
+            parts.append(extra)
+        try:
+            if item.jf.indexed and item.jf.note(item.ii or 0):
+                parts.append("✎")
+        except (IndexError, OSError):
+            pass
+        return " ".join(parts)
 
     def _sync_strip(self):
         if not self.files:
@@ -1942,14 +2301,18 @@ class JpgsWindow(Adw.ApplicationWindow):
         if not self.files:
             return
         jf = self.files[self.fi]
-        if jf.is_video:
-            self._save_video_as(jf)
+        if self._cur_is_video():
+            self._save_video_as(jf, self.ii)
             return
         if self.view.tex is None:
             return
         base = jf.name[:-5] if jf.name.lower().endswith(".jpgs") else jf.name
+        try:
+            ext = jf.entry(self.ii).ext or "jpg"
+        except (IndexError, OSError, C.ArchiveError):
+            ext = "jpg"
         dlg = Gtk.FileDialog(title="Сохранить расшифрованное изображение",
-                             initial_name=f"{base}_{self.ii + 1}.jpg")
+                             initial_name=f"{base}_{self.ii + 1}.{ext}")
 
         def picked(d, res):
             try:
@@ -1971,11 +2334,13 @@ class JpgsWindow(Adw.ApplicationWindow):
             self._current_bytes_async(write)
         dlg.save(self, None, picked)
 
-    def _save_video_as(self, jf):
-        base = jf.name[:-5] if jf.name.lower().endswith(".vids") else jf.name
+    def _save_video_as(self, jf, ii=0):
+        base = jf.name[:-5] if jf.name.lower().endswith((".vids", ".jpgs")) else jf.name
+        if not jf.is_video:
+            base += f"_{ii + 1}"
         try:
-            ext = jf.video_ext()
-        except OSError:
+            ext = jf.video_ext(ii)
+        except (OSError, IndexError, C.ArchiveError):
             ext = "mp4"
         dlg = Gtk.FileDialog(title="Сохранить расшифрованное видео", initial_name=f"{base}.{ext}")
 
@@ -1985,7 +2350,8 @@ class JpgsWindow(Adw.ApplicationWindow):
             except GLib.Error:
                 return
             self.run_bg("Сохранение видео…",
-                        lambda: C.decrypt_video_file(jf.path, dest, self.cipher, self._progress_toast()),
+                        lambda: C.decrypt_video_file(jf.path, dest, jf.cipher, self._progress_toast(),
+                                                     index=ii),
                         lambda p: self.toast(f"Сохранено: {os.path.basename(p)}"))
         dlg.save(self, None, picked)
 
@@ -2020,6 +2386,26 @@ class JpgsWindow(Adw.ApplicationWindow):
             self.toast("Изображение скопировано")
             return False
         self.pool.submit(job)
+
+    def close_files(self):
+        """Закрыть все файлы и очистить кэши расшифрованного (после блокировки)."""
+        self._stop_slideshow()
+        self.video.stop()
+        self.files = []
+        self.counts.clear()
+        self.tex_cache.clear()
+        with self.bytes_lock:
+            self.bytes_cache.clear()
+            self.bytes_total = 0
+        self._rebuild_strip()
+        self._update_strip_visibility()
+        self.view.clear()
+        self.stack.set_visible_child_name("image")
+        self.error_page.set_visible(False)
+        self.note_revealer.set_reveal_child(False)
+        self.status.set_visible(True)
+        self._update_title()
+        self._update_actions()
 
     def trash_current(self):
         if not self.files:
@@ -2094,77 +2480,122 @@ class JpgsWindow(Adw.ApplicationWindow):
         if self.app.cipher is None:
             self.app.require_key(self, lambda: self._confirm_encrypt(paths))
             return
-        d = Adw.AlertDialog(heading=f"Зашифровать {plural(len(paths), 'файл', 'файла', 'файлов')}?",
-                            body="Файлы .jpgs (изображения) и .vids (видео и анимированные GIF) появятся рядом с оригиналами "
-                                 "со случайными именами. Оригиналы можно сразу убрать в корзину.")
+        many = len(paths) > 1
+        d = Adw.AlertDialog(
+            heading=f"Зашифровать {plural(len(paths), 'файл', 'файла', 'файлов')}?",
+            body="По отдельности: рядом с оригиналами появятся .jpgs (картинки) и .vids (видео, "
+                 "анимированные GIF) со случайными именами."
+                 + ("\nВ один архив: картинки и видео вместе в одном .jpgs." if many else ""))
+        remove = Gtk.CheckButton(label="Удалить оригиналы (безвозвратно, после проверки)")
+        remove.set_tooltip_text("Каждый файл удаляется только если зашифрованная копия "
+                                "расшифровывается в точности в него. Не в корзину: там он "
+                                "остался бы незашифрованным.")
+        d.set_extra_child(remove)
         d.add_response("cancel", "Отмена")
-        d.add_response("keep", "Зашифровать")
-        d.add_response("trash", "Зашифровать и удалить оригиналы")
-        d.set_response_appearance("trash", Adw.ResponseAppearance.DESTRUCTIVE)
+        if many:
+            d.add_response("pack", "В один архив…")
+        d.add_response("keep", "По отдельности" if many else "Зашифровать")
         d.set_response_appearance("keep", Adw.ResponseAppearance.SUGGESTED)
         d.set_default_response("keep")
         d.set_close_response("cancel")
 
         def resp(_d, r):
-            if r == "cancel":
-                return
-            remove = r == "trash"
-            total = sum(os.path.getsize(p) for p in paths if os.path.exists(p)) or 1
-            prog = self._progress_toast() if total > 32 * 1024 * 1024 else None
-            done_bytes = [0]
-
-            def work():
-                out, failed = [], []
-                for p in paths:
-                    try:
-                        size = os.path.getsize(p)
-                        if C.is_video_source(p):
-                            base = done_bytes[0]
-                            res = C.encrypt_stream(p, os.path.dirname(p), self.cipher,
-                                                   (lambda d, t, base=base: prog(base + d, total))
-                                                   if prog else None)
-                        else:
-                            res = C.encrypt_file(p, os.path.dirname(p), self.cipher)
-                        done_bytes[0] += size
-                        if prog:
-                            prog(done_bytes[0], total)
-                    except Exception:  # noqa: BLE001
-                        res = None
-                    if res:
-                        out.append(res)
-                        if remove:
-                            try:
-                                Gio.File.new_for_path(p).trash(None)
-                            except GLib.Error:
-                                pass
-                    else:
-                        failed.append(os.path.basename(p))
-                return out, failed
-
-            def done(res):
-                out, failed = res
-                msg = f"Зашифровано: {len(out)}"
-                if failed:
-                    msg += f", не удалось: {len(failed)}"
-                self.toast(msg)
-                if out:
-                    folder = os.path.dirname(out[0])
-                    if not self.files or folder == self.folder:
-                        cur = self.files[self.fi].path if self.files else out[0]
-                        self.open_path(cur)
-            self.run_bg("Шифрование…", work, done)
+            if r == "keep":
+                self._encrypt_each(paths, remove.get_active())
+            elif r == "pack":
+                self._encrypt_pack(paths, remove.get_active())
         d.connect("response", resp)
         d.present(self)
 
+    def _encrypt_each(self, paths: list[str], remove: bool):
+        cipher = self.cipher
+        total = sum(_size(p) for p in paths) or 1
+        prog = self._progress_toast() if total > 32 * 1024 * 1024 else None
+        done_bytes = [0]
+
+        def work():
+            out, failed, removed = [], [], 0
+            for p in paths:
+                try:
+                    size = os.path.getsize(p)
+                    if C.is_video_source(p):
+                        base = done_bytes[0]
+                        res = C.encrypt_stream(p, os.path.dirname(p), cipher,
+                                               (lambda d, t, base=base: prog(base + d, total))
+                                               if prog else None)
+                    else:
+                        res = C.encrypt_file(p, os.path.dirname(p), cipher)
+                    done_bytes[0] += size
+                    if prog:
+                        prog(done_bytes[0], total)
+                except Exception:  # noqa: BLE001
+                    traceback.print_exc()
+                    res = None
+                if res:
+                    out.append(res)
+                    if remove and C.verify_import(res, cipher, 0, [p], cipher):
+                        removed += _dispose_originals([p])
+                else:
+                    failed.append(os.path.basename(p))
+            return out, failed, removed
+
+        def done(res):
+            out, failed, removed = res
+            msg = f"Зашифровано: {len(out)}"
+            if failed:
+                msg += f", не удалось: {len(failed)}"
+            if remove:
+                msg += f" · оригиналов удалено: {removed}"
+            self.toast(msg)
+            if out:
+                folder = os.path.dirname(out[0])
+                if not self.files or folder == self.folder:
+                    cur = self.files[self.fi].path if self.files else out[0]
+                    self.open_path(cur)
+        self.run_bg("Шифрование…", work, done)
+
+    def _encrypt_pack(self, paths: list[str], remove: bool):
+        """Все выбранные картинки и видео — в один новый архив .jpgs."""
+        folder = os.path.dirname(paths[0])
+        dlg = Gtk.FileDialog(title="Сохранить архив", initial_name=f"{uuid.uuid4()}.jpgs")
+        dlg.set_initial_folder(Gio.File.new_for_path(folder))
+        cipher = self.cipher
+
+        def picked(d, res):
+            try:
+                dest = d.save_finish(res).get_path()
+            except GLib.Error:
+                return
+            if not dest.lower().endswith(".jpgs"):
+                dest += ".jpgs"
+            prog = self._progress_toast() if sum(_size(p) for p in paths) > 32 << 20 else None
+
+            def work():
+                out = C.build_archive(paths, dest, cipher, progress=prog)
+                removed = 0
+                if remove and C.verify_import(out, cipher, 0, paths, cipher):
+                    removed = _dispose_originals(paths)
+                return out, removed
+
+            def done(res):
+                out, removed = res
+                self.toast(f"Архив создан: {os.path.basename(out)}"
+                           + (f" · оригиналов удалено: {removed}" if remove else ""))
+                self.open_path(out)
+            self.run_bg("Создание архива…", work, done)
+        dlg.save(self, None, picked)
+
     def merge_dialog(self):
-        dlg = Gtk.FileDialog(title="Выберите .jpgs для объединения (в порядке имён)")
-        f = Gtk.FileFilter(name=".jpgs")
+        dlg = Gtk.FileDialog(title="Выберите .jpgs и .vids для объединения (в порядке имён)")
+        f = Gtk.FileFilter(name=".jpgs и .vids")
         f.add_pattern("*.jpgs")
+        f.add_pattern("*.vids")
         store = Gio.ListStore(item_type=Gtk.FileFilter)
         store.append(f)
         dlg.set_filters(store)
         if self.folder:
             dlg.set_initial_folder(Gio.File.new_for_path(self.folder))
+        keys = self.app.keyring
 
         def picked(d, res):
             try:
@@ -2176,6 +2607,9 @@ class JpgsWindow(Adw.ApplicationWindow):
             if len(paths) < 2:
                 self.toast("Выберите хотя бы два файла")
                 return
+            if keys is None:
+                self.toast("Нет ключа")
+                return
             sd = Gtk.FileDialog(title="Сохранить объединённый файл", initial_name="merged.jpgs")
             sd.set_initial_folder(Gio.File.new_for_path(os.path.dirname(paths[0])))
 
@@ -2184,7 +2618,13 @@ class JpgsWindow(Adw.ApplicationWindow):
                     dest = d2.save_finish(res2).get_path()
                 except GLib.Error:
                     return
-                self.run_bg("Объединение…", lambda: C.merge_files(paths, dest),
+                if not dest.lower().endswith(".jpgs"):
+                    dest += ".jpgs"
+                if any(C._same(dest, p) for p in paths):
+                    self.toast("Сохраните результат в новый файл")
+                    return
+                prog = self._progress_toast() if sum(_size(p) for p in paths) > 32 << 20 else None
+                self.run_bg("Объединение…", lambda: C.merge_media(paths, dest, keys, progress=prog),
                             lambda p: (self.toast(f"Готово: {os.path.basename(p)}"), self.open_path(p)))
             sd.save(self, None, saved)
         dlg.open_multiple(self, None, picked)
@@ -2192,8 +2632,9 @@ class JpgsWindow(Adw.ApplicationWindow):
     def decrypt_folder_dialog(self):
         if not self.files:
             return
-        dlg = Gtk.FileDialog(title="Куда сохранить расшифрованные изображения")
+        dlg = Gtk.FileDialog(title="Куда сохранить расшифрованные файлы")
         paths = [f.path for f in self.files]
+        kr = self.app.keyring
 
         def picked(d, res):
             try:
@@ -2202,16 +2643,25 @@ class JpgsWindow(Adw.ApplicationWindow):
                 return
 
             def work():
-                n = 0
+                n, skipped = 0, 0
                 for p in paths:
-                    if C.is_video_path(p):
-                        C.decrypt_video_to(p, out, self.cipher)
-                        n += 1
-                    else:
-                        n += len(C.decrypt_to_dir(p, out, self.cipher))
-                return n
+                    c = kr.cipher_for(p) if kr else self.cipher
+                    if c is None:
+                        skipped += 1  # ни один ключ не подходит — мусор не сохраняем
+                        continue
+                    try:
+                        if C.is_video_path(p):
+                            C.decrypt_video_to(p, out, c)
+                            n += 1
+                        else:
+                            n += len(C.decrypt_to_dir(p, out, c))
+                    except Exception:  # noqa: BLE001
+                        traceback.print_exc()
+                        skipped += 1
+                return n, skipped
             self.run_bg("Расшифровка…", work,
-                        lambda n: self.toast(f"Расшифровано файлов: {n} → {out}"))
+                        lambda r: self.toast(f"Расшифровано записей: {r[0]} → {out}"
+                                             + (f" · пропущено файлов: {r[1]}" if r[1] else "")))
         dlg.select_folder(self, None, picked)
 
     def show_shortcuts(self):
@@ -2223,6 +2673,7 @@ class JpgsWindow(Adw.ApplicationWindow):
                 "R / Shift+R — поворот\nF, F11 — полный экран; Esc — выход\n"
                 "F5 — слайд-шоу; T — лента миниатюр; Shift+T — лента: файлы ↔ кадры\n"
                 "Ctrl+S — сохранить; Ctrl+C — копировать; Delete — в корзину\n"
+                "N — заметка; Shift+N — показывать заметки; Ctrl+L — заблокировать\n"
                 "Ctrl+O — открыть; Ctrl+W — закрыть\n\n"
                 "Видео: Пробел или клик — пауза; двойной клик — полный экран;\n"
                 "Ctrl+← → — перемотка ±10 с; ↑ ↓ или колёсико — громкость; M — звук")
@@ -2240,6 +2691,7 @@ class JpgsWindow(Adw.ApplicationWindow):
     def _on_close(self, *_):
         self._stop_slideshow()
         self.ctx_popover.unparent()
+        self.strip_popover.unparent()
         self.video.destroy()
         self.app.settings.set("volume", self.app.settings.get("volume"))
         self.pool.shutdown(wait=False, cancel_futures=True)
@@ -2258,11 +2710,20 @@ class JpgsApp(Adw.Application):
             flags |= Gio.ApplicationFlags.NON_UNIQUE
         super().__init__(application_id=APP_ID, flags=flags)
         self.settings = Settings()
-        try:
-            self.cipher: Optional[Cipher] = Cipher()
-        except KeyMissing:
-            self.cipher = None
+        self.keyring: Optional[KeyRing] = None
+        self.cipher: Optional[Cipher] = None
+        self.reload_keys()
         self.encrypt = [os.path.abspath(p) for p in encrypt or []]
+
+    def reload_keys(self) -> bool:
+        """Перечитать ключи: активный — для новых файлов, все — для открытия любых файлов."""
+        try:
+            self.keyring = KeyRing.from_config()
+            self.cipher = self.keyring.active
+        except KeyMissing:
+            self.keyring = None
+            self.cipher = None
+        return self.cipher is not None
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -2287,6 +2748,9 @@ class JpgsApp(Adw.Application):
         about = Gio.SimpleAction.new("about", None)
         about.connect("activate", self._about)
         self.add_action(about)
+        lock = Gio.SimpleAction.new("lock", None)
+        lock.connect("activate", lambda *_: self.lock())
+        self.add_action(lock)
         q = Gio.SimpleAction.new("quit", None)
         q.connect("activate", lambda *_: [w.close() for w in self.get_windows()])
         self.add_action(q)
@@ -2308,6 +2772,9 @@ class JpgsApp(Adw.Application):
             "win.escape": ["Escape"],
             "win.slideshow": ["F5"],
             "win.filmstrip": ["t"],
+            "win.note-edit": ["n"],
+            "win.notes-show": ["<Shift>n"],
+            "app.lock": ["<Control>l"],
             "win.strip-mode-cycle": ["<Shift>t"],
             "win.open": ["<Control>o"],
             "win.save-as": ["<Control>s"],
@@ -2331,11 +2798,12 @@ class JpgsApp(Adw.Application):
         win = self.get_active_window() or JpgsWindow(self)
         win.present()
         from .keystore import get_keystore
+        paths, self.encrypt = self.encrypt, []
         if get_keystore().is_locked():
-            GLib.idle_add(lambda: keys_ui.unlock_dialog(self, win, None) and False)
+            then = (lambda: win._confirm_encrypt(paths)) if paths else None
+            GLib.idle_add(lambda: keys_ui.unlock_dialog(self, win, then) and False)
             return
-        if self.encrypt:
-            paths, self.encrypt = self.encrypt, []
+        if paths:
             GLib.idle_add(lambda: win._confirm_encrypt(paths) and False)
         elif self.cipher is None:
             GLib.idle_add(lambda: self.require_key(win, lambda: None) and False)
@@ -2353,6 +2821,23 @@ class JpgsApp(Adw.Application):
             keys_ui.unlock_dialog(self, win, then)
         else:
             keys_ui.add_key_dialog(self, win, then)
+
+    def lock(self):
+        """Забыть разблокированное хранилище: окна закрывают файлы, пароль спросится снова."""
+        from .keystore import get_keystore
+        ks = get_keystore()
+        if not ks.is_encrypted():
+            win = self.get_active_window()
+            if win is not None and hasattr(win, "toast"):
+                win.toast("Пароль на программу не задан — блокировать нечего "
+                          "(«Ключи шифрования…» → «Пароль на программу»)")
+            return
+        ks.lock()
+        self.reload_keys()
+        for w in self.get_windows():
+            if isinstance(w, JpgsWindow):
+                w.close_files()
+                w.toast("Заблокировано")
 
     def key_manager(self, win):
         """Меню → Ключи шифрования…"""
@@ -2394,6 +2879,29 @@ def _focus_later(widget, select_all: bool = False):
             widget.select_region(0, -1)
         return False
     GLib.idle_add(once)
+
+
+def _size(p: str) -> int:
+    try:
+        return os.path.getsize(p)
+    except OSError:
+        return 0
+
+
+def _dispose_originals(paths: list[str]) -> int:
+    """Убрать оригиналы после проверенного шифрования: открытые файлы — безвозвратно
+    (в корзине они так и лежали бы незашифрованными), зашифрованные — в корзину."""
+    n = 0
+    for p in paths:
+        try:
+            if p.lower().endswith((".jpgs", ".vids")):
+                Gio.File.new_for_path(p).trash(None)
+            else:
+                os.remove(p)
+            n += 1
+        except (OSError, GLib.Error):
+            pass
+    return n
 
 
 def human_size(n: int) -> str:
