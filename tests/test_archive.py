@@ -401,12 +401,22 @@ class CliTests(unittest.TestCase):
         rc, out = self.run_cli("note", arch, "2", "моё видео")
         self.assertEqual(rc, 0, out)
         rc, out = self.run_cli("info", arch)
-        self.assertIn("1 изображений, 1 видео", out)
+        self.assertIn("1 изображение, 1 видео", out)
         self.assertIn("заметок: 1", out)
         rc, out = self.run_cli("decrypt", arch, "-o", os.path.join(self.d, "out"))
         self.assertEqual(rc, 0, out)
         self.assertEqual(sorted(os.listdir(os.path.join(self.d, "out"))),
                          ["x_1.jpg", "x_2.mp4", "x_2.txt"])
+
+    def test_encrypt_to_new_folder_and_remove(self):
+        src = os.path.join(self.d, "p.jpg")
+        with open(src, "wb") as f:
+            f.write(fake_jpeg(b"p"))
+        out_dir = os.path.join(self.d, "нет", "такой")
+        rc, out = self.run_cli("encrypt", src, "-o", out_dir, "--remove")
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(src))
+        self.assertEqual(len(os.listdir(out_dir)), 1)
 
     def test_weak_new_key_rejected(self):
         os.environ.pop("JPGS_KEY")

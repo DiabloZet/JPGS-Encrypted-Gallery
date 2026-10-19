@@ -373,6 +373,12 @@ def keys_cmd(rest: list[str]) -> int:
     return 0
 
 
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    n10, n100 = n % 10, n % 100
+    w = one if n10 == 1 and n100 != 11 else few if 2 <= n10 <= 4 and not 12 <= n100 <= 14 else many
+    return f"{n} {w}"
+
+
 def _cipher_or_skip(ring: KeyRing, p: str) -> Cipher | None:
     c = ring.cipher_for(p)
     if c is None:
@@ -474,7 +480,7 @@ def _main(cmd: str, rest: list[str]) -> int:
             print(f"Ошибка: {e}", file=sys.stderr)
             return 1
         n = C.JpgsFile(out, cipher).count()
-        print(f"Готово: {out} ({n} записей)")
+        print(f"Готово: {out} ({_plural(n, 'запись', 'записи', 'записей')})")
         if a.remove:
             if C.verify_import(out, cipher, 0, a.files, ring):
                 for p in a.files:
@@ -523,7 +529,13 @@ def _main(cmd: str, rest: list[str]) -> int:
     if cmd == "encrypt":
         for p in a.files:
             dest = a.out or os.path.dirname(os.path.abspath(p))
-            out = _encrypt_one(p, dest, cipher, a.remove)
+            try:
+                os.makedirs(dest, exist_ok=True)
+                out = _encrypt_one(p, dest, cipher, a.remove)
+            except Exception as e:  # noqa: BLE001
+                print(f"{p}: не удалось — {e}", file=sys.stderr)
+                rc = 1
+                continue
             print(f"{p} → {out}" if out else f"{p}: не изображение и не видео")
             rc |= 0 if out else 1
     elif cmd == "decrypt":
@@ -533,11 +545,15 @@ def _main(cmd: str, rest: list[str]) -> int:
             if c is None:
                 rc = 1
                 continue
-            if C.is_video_path(p):
-                print(f"{p} → {C.decrypt_video_to(p, dest, c)}")
-            else:
-                out = C.decrypt_to_dir(p, dest, c)
-                print(f"{p}: {len(out)} записей")
+            try:
+                if C.is_video_path(p):
+                    print(f"{p} → {C.decrypt_video_to(p, dest, c)}")
+                else:
+                    out = C.decrypt_to_dir(p, dest, c)
+                    print(f"{p}: {_plural(len(out), 'запись', 'записи', 'записей')}")
+            except Exception as e:  # noqa: BLE001
+                print(f"{p}: не удалось — {e}", file=sys.stderr)
+                rc = 1
     elif cmd == "info":
         for p in a.files:
             c = ring.cipher_for(p)
@@ -550,7 +566,8 @@ def _main(cmd: str, rest: list[str]) -> int:
             vids = sum(e.is_video for e in es)
             notes = sum(bool(e.note) for e in es)
             what = (f"видео {jf.video_ext()}" if jf.is_video else
-                    f"{len(es) - vids} изображений" + (f", {vids} видео" if vids else ""))
+                    _plural(len(es) - vids, "изображение", "изображения", "изображений")
+                    + (f", {vids} видео" if vids else ""))
             print(f"{p}: {what}, {os.path.getsize(p)} байт, ключ «{ring.name_of(c)}»"
                   + (f", заметок: {notes}" if notes else "")
                   + (", архив v2" if jf.is_v2 else ""))
