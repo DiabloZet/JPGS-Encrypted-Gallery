@@ -27,6 +27,18 @@ WORD_ENV = "JPGS_WORD"      # слово нового формата (усили
 KDF_SALT = b"jpgs-kdf-v1"
 KDF_ITERS = 300_000
 
+# Ключи третьего поколения (по умолчанию для новых): scrypt. Он требует не только времени,
+# но и памяти (128 МиБ на одну попытку), поэтому перебор на видеокартах и специализированных
+# чипах дорожает в сотни раз по сравнению с PBKDF2. Соль фиксированная по той же причине,
+# что и выше: слово должно давать тот же ключ на любом компьютере.
+SCRYPT_SALT = b"jpgs-kdf-v2"
+SCRYPT_N, SCRYPT_R, SCRYPT_P = 1 << 17, 8, 1
+SCRYPT_MAXMEM = 256 * 1024 * 1024
+
+# Типы ключей: 'raw' — байты слова (Java-версия), 'derived' — PBKDF2, 'scrypt' — scrypt.
+KEY_KINDS = ("raw", "derived", "scrypt")
+DEFAULT_KIND = "scrypt"
+
 
 class KeyMissing(Exception):
     """Ключ шифрования не задан (см. `jpgs set-key`)."""
@@ -65,9 +77,76 @@ def derive_material(word: str, iters: int = KDF_ITERS) -> bytes:
     return hashlib.pbkdf2_hmac("sha256", word.encode("utf-8"), KDF_SALT, iters, 32)
 
 
+def scrypt_material(word: str) -> bytes:
+    """Слово → 32 байта ключа через scrypt (N=2^17, r=8: ~0,3–1 с и 128 МиБ на попытку)."""
+    import hashlib
+    return hashlib.scrypt(word.encode("utf-8"), salt=SCRYPT_SALT, n=SCRYPT_N, r=SCRYPT_R,
+                          p=SCRYPT_P, maxmem=SCRYPT_MAXMEM, dklen=32)
+
+
 def material_for(key: str, kind: str = "derived") -> bytes:
-    """Байты ключа по слову и типу записи: 'raw' — старый формат, 'derived' — усиленный."""
-    return key_bytes(key) if kind == "raw" else derive_material(key)
+    """Байты ключа по слову и типу записи: 'raw' — старый формат, 'derived' — PBKDF2,
+    'scrypt' — самый стойкий (по умолчанию для новых ключей)."""
+    if kind == "raw":
+        return key_bytes(key)
+    if kind == "scrypt":
+        return scrypt_material(key)
+    return derive_material(key)
+
+
+# --------------------------------------------------------------------------- стойкость слова
+
+def estimate_entropy(word: str) -> float:
+    """Грубая оценка энтропии слова в битах (с поправкой на повторы и последовательности).
+
+    Не заменяет настоящий словарный анализ, но надёжно ловит короткие и однообразные
+    ключи вроде «123456», «qwerty», «aaaaaaaa»: им даётся почти ноль бит.
+    """
+    if not word:
+        return 0.0
+    import math
+    pool = 0
+    if any(c.islower() and c.isascii() for c in word):
+        pool += 26
+    if any(c.isupper() and c.isascii() for c in word):
+        pool += 26
+    if any(c.isdigit() for c in word):
+        pool += 10
+    if any(not c.isascii() and c.isalpha() for c in word):
+        pool += 33  # кириллица и т.п.
+    if any(not c.isalnum() for c in word):
+        pool += 33
+    pool = max(pool, 10)
+    # «эффективная длина»: повторы и шаги ±1 (abc, 123, aaa) почти не добавляют стойкости
+    eff = 1.0
+    for a, b in zip(word, word[1:]):
+        d = ord(b) - ord(a)
+        eff += 0.2 if d in (-1, 0, 1) else 1.0
+    distinct = len(set(word))
+    eff = min(eff, distinct * 2.5)
+    return eff * math.log2(pool)
+
+
+MIN_KEY_LEN = 10
+MIN_KEY_BITS = 50.0
+GOOD_KEY_BITS = 72.0
+
+
+def key_strength(word: str) -> tuple[bool, str]:
+    """(можно ли принять, пояснение) — для окна добавления ключа и CLI.
+
+    Оценка по символам грубая: словарные слова, имена и даты подбираются быстрее,
+    чем следует из длины. Поэтому порог высокий, а совет — фраза из нескольких слов.
+    """
+    bits = estimate_entropy(word)
+    if len(word) < MIN_KEY_LEN:
+        return False, f"Слишком короткий: нужно не меньше {MIN_KEY_LEN} символов"
+    if bits < MIN_KEY_BITS:
+        return False, "Слишком простой: добавьте слов, цифр или знаков"
+    if bits < GOOD_KEY_BITS:
+        return True, ("Надёжность средняя. Лучше фраза из 4–5 случайных слов "
+                      "или сгенерированный ключ")
+    return True, "Надёжность хорошая (если это не известная фраза или цитата)"
 
 
 def fingerprint_material(material: bytes) -> str:
@@ -255,6 +334,43 @@ def block_cipher(key32: bytes, backend: str | None = None):
     return _make_backend(key32, backend)
 
 
+def _pkcs7(data: bytes) -> bytes:
+    pad = BLOCK - len(data) % BLOCK
+    return data + bytes([pad]) * pad
+
+
+def _unpkcs7(data: bytes) -> bytes:
+    if not data or len(data) % BLOCK:
+        raise ValueError("повреждённые данные")
+    p = data[-1]
+    if p < 1 or p > BLOCK or data[-p:] != bytes([p]) * p:
+        raise ValueError("неверный паддинг")
+    return data[:-p]
+
+
+def cbc_encrypt(key32: bytes, iv: bytes, plaintext: bytes) -> bytes:
+    """AES-256-CBC + PKCS#7 поверх блочного AES проекта (не зависит от бэкенда)."""
+    bc = block_cipher(key32)
+    data = _pkcs7(plaintext)
+    out = bytearray()
+    prev = iv
+    for i in range(0, len(data), BLOCK):
+        blk = bytes(a ^ b for a, b in zip(data[i:i + BLOCK], prev))
+        prev = bc.encrypt_blocks(blk)
+        out += prev
+    return bytes(out)
+
+
+def cbc_decrypt(key32: bytes, iv: bytes, ct: bytes) -> bytes:
+    if len(ct) % BLOCK or not ct:
+        raise ValueError("повреждённые данные")
+    bc = block_cipher(key32)
+    dec = bc.decrypt_blocks(ct)  # ECB-расшифровка всех блоков разом, затем XOR с цепочкой
+    prev = iv + ct[:-BLOCK]
+    out = (int.from_bytes(dec, "big") ^ int.from_bytes(prev, "big")).to_bytes(len(ct), "big")
+    return _unpkcs7(out)
+
+
 class Cipher:
     """AES-256-ECB. *_blocks — без паддинга (длина кратна 16).
 
@@ -272,6 +388,32 @@ class Cipher:
             raise ValueError("ключ должен быть длиной 32 байта")
         self._b = _make_backend(material, backend)
         self.backend = type(self._b).__name__
+        self.material = material
+        self._sub: dict[bytes, bytes] = {}
+
+    def subkey(self, label: bytes) -> bytes:
+        """Независимый 32-байтный подключ (HMAC-SHA256 от ключа файла) — для индекса архива.
+
+        Отдельные ключи для индекса и его проверки: содержимое кадров никак не может
+        «подставиться» под них, как могло бы при шифровании констант тем же AES.
+        """
+        k = self._sub.get(label)
+        if k is None:
+            import hashlib
+            import hmac
+            k = hmac.new(self.material, b"jpgs-subkey:" + label, hashlib.sha256).digest()
+            self._sub[label] = k
+        return k
+
+    @property
+    def fingerprint(self) -> str:
+        return fingerprint_material(self.material)
+
+    def __eq__(self, other):
+        return isinstance(other, Cipher) and other.material == self.material
+
+    def __hash__(self):
+        return hash(self.material)
 
     def decrypt_blocks(self, data: bytes) -> bytes:
         return self._b.decrypt_blocks(data)
@@ -296,3 +438,69 @@ def strip_padding(plain: bytes) -> bytes:
         if 1 <= p <= BLOCK and plain.endswith(bytes([p]) * p):
             return plain[:-p]
     return plain
+
+
+# --------------------------------------------------------------------------- связка ключей
+
+class KeyRing:
+    """Все известные ключи сразу: файлы открываются тем ключом, которым зашифрованы.
+
+    active — ключ для новых файлов (активный в хранилище). Остальные пробуются при открытии:
+    у каждого формата есть быстрая проверка (сигнатура первого блока или HMAC индекса),
+    поэтому подбор ключа к файлу стоит одну расшифровку блока на ключ.
+    """
+
+    def __init__(self, active: Cipher, others: list[Cipher] | None = None,
+                 names: dict[bytes, str] | None = None):
+        self.active = active
+        seen = {active.material}
+        self.ciphers = [active]
+        for c in others or []:
+            if c.material not in seen:
+                seen.add(c.material)
+                self.ciphers.append(c)
+        self.names = names or {}
+        self._cache: dict[tuple, Cipher | None] = {}
+
+    @classmethod
+    def from_config(cls) -> "KeyRing":
+        """Активный ключ (окружение/хранилище) плюс все остальные ключи хранилища."""
+        active = Cipher()
+        others: list[Cipher] = []
+        names: dict[bytes, str] = {}
+        try:
+            from . import keystore
+            ks = keystore.get_keystore()
+            if ks.exists() and ks.is_unlocked():
+                for e in ks.entries():
+                    mat = ks.material_by_id(e["id"])
+                    names[mat] = e["name"]
+                    others.append(Cipher(material=mat))
+        except KeyMissing:
+            pass
+        return cls(active, others, names)
+
+    def name_of(self, cipher: Cipher) -> str:
+        return self.names.get(cipher.material, cipher.fingerprint)
+
+    def cipher_for(self, path: str) -> Cipher | None:
+        """Ключ, которым зашифрован файл, или None (ни один не подходит / файл повреждён)."""
+        try:
+            st = os.stat(path)
+            sig = (path, st.st_size, st.st_mtime_ns)
+        except OSError:
+            return None
+        if sig in self._cache:
+            return self._cache[sig]
+        from . import container
+        found = None
+        for c in self.ciphers:
+            if container.verify_media(path, c):
+                found = c
+                break
+        self._cache[sig] = found
+        return found
+
+    def forget(self, path: str):
+        for k in [k for k in self._cache if k[0] == path]:
+            del self._cache[k]

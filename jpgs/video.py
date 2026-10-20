@@ -33,15 +33,26 @@ class VideoInfo:
         self.width, self.height, self.duration, self.rotation = width, height, duration, rotation
 
 
+def _open_src(path: str, cipher: Cipher, entry=None) -> "C.DecryptedFile":
+    """Поток расшифровки: весь .vids или одна запись-видео архива (entry)."""
+    if entry is None:
+        jf = C.open_media(path, cipher)
+        entry = jf.entry(0) if jf.is_video else None
+    if entry is None:
+        return C.DecryptedFile(path, cipher)
+    return C.DecryptedFile(path, cipher, entry.start, entry.length)
+
+
 def grab_frame(path: str, cipher: Cipher, max_side: Optional[int] = 256,
-               at: Optional[float] = None):
+               at: Optional[float] = None, entry=None):
     """(pixels: bytes, w, h, stride, info) — кадр из зашифрованного видео.
 
     at=None — кадр примерно с 10% длительности (для миниатюр); иначе кадр у времени at.
     max_side=None — без уменьшения (полное разрешение, для сохранения кадра).
+    entry — запись архива (видео внутри .jpgs); по умолчанию — видео .vids целиком.
     """
     import av  # PyAV — привязка к libavformat/libavcodec
-    with C.DecryptedFile(path, cipher) as f, av.open(f, mode="r") as ct:
+    with _open_src(path, cipher, entry) as f, av.open(f, mode="r") as ct:
         vs = ct.streams.video[0]
         vs.thread_type = "AUTO"
         dur = float(ct.duration) / 1e6 if ct.duration else 0.0
@@ -76,7 +87,7 @@ def grab_frame(path: str, cipher: Cipher, max_side: Optional[int] = 256,
         return bytes(plane), tw, th, plane.line_size, info
 
 
-def save_frame_png(path: str, cipher: Cipher, time_pos: float, dest: str) -> None:
+def save_frame_png(path: str, cipher: Cipher, time_pos: float, dest: str, entry=None) -> None:
     """Сохраняет кадр видео у времени time_pos как PNG (полное разрешение, с учётом поворота).
 
     Декодирует нужный кадр через PyAV прямо из зашифрованного потока — надёжнее, чем
@@ -85,7 +96,7 @@ def save_frame_png(path: str, cipher: Cipher, time_pos: float, dest: str) -> Non
     import gi
     gi.require_version("GdkPixbuf", "2.0")
     from gi.repository import GdkPixbuf, GLib
-    data, w, h, stride, info = grab_frame(path, cipher, max_side=None, at=time_pos)
+    data, w, h, stride, info = grab_frame(path, cipher, max_side=None, at=time_pos, entry=entry)
     pb = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(data), GdkPixbuf.Colorspace.RGB,
                                          False, 8, w, h, stride)
     if info.rotation:
@@ -94,11 +105,11 @@ def save_frame_png(path: str, cipher: Cipher, time_pos: float, dest: str) -> Non
         raise OSError("не удалось записать PNG")
 
 
-def frame_pixbuf(path: str, cipher: Cipher, max_side: int = 256):
+def frame_pixbuf(path: str, cipher: Cipher, max_side: int = 256, entry=None):
     import gi
     gi.require_version("GdkPixbuf", "2.0")
     from gi.repository import GdkPixbuf, GLib
-    data, w, h, stride, info = grab_frame(path, cipher, max_side)
+    data, w, h, stride, info = grab_frame(path, cipher, max_side, entry=entry)
     pb = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(data), GdkPixbuf.Colorspace.RGB,
                                          False, 8, w, h, stride)
     if info.rotation:
@@ -218,8 +229,8 @@ def _gl_get_proc():
 class _Stream:
     """Состояние одного открытого потока для libmpv (вызывается из потока демуксера mpv)."""
 
-    def __init__(self, path: str, cipher: Cipher):
-        self.f = C.DecryptedFile(path, cipher)
+    def __init__(self, path: str, cipher: Cipher, entry=None):
+        self.f = _open_src(path, cipher, entry)
         self.lock = threading.Lock()
 
 
@@ -237,7 +248,7 @@ class MpvPlayer:
         self.cipher = cipher
         self.on_event = on_event
         self.streams: dict[int, _Stream] = {}
-        self.paths: dict[str, str] = {}
+        self.paths: dict[str, tuple] = {}  # ключ потока → (путь, шифр, запись)
         self.render_ctx = c_void_p()
         self._pending_wakeup = False
         # libmpv работает только с LC_NUMERIC="C" (иначе mpv_create() возвращает NULL).
@@ -288,9 +299,9 @@ class MpvPlayer:
     def _open(self, user, uri, info_p):
         try:
             key = uri.decode()[len("jpgsvid://"):]
-            path = self.paths[key]
+            path, cipher, entry = self.paths[key]
             sid = next(self._ids)
-            self.streams[sid] = _Stream(path, self.cipher)
+            self.streams[sid] = _Stream(path, cipher, entry)
             info = info_p.contents
             info.cookie = sid
             info.read_fn, info.seek_fn = self._cb_read, self._cb_seek
@@ -387,9 +398,11 @@ class MpvPlayer:
                 value = "yes" if value else "no"
             self.lib.mpv_set_property_string(self.h, name.encode(), str(value).encode())
 
-    def load(self, path: str):
+    def load(self, path: str, cipher: Optional[Cipher] = None, entry=None):
+        """Открыть видео: .vids целиком или запись-видео архива. cipher — ключ этого файла
+        (у разных файлов могут быть разные ключи)."""
         key = f"v{next(self._ids)}"
-        self.paths = {key: path}  # старые потоки закроются mpv сам
+        self.paths = {key: (path, cipher or self.cipher, entry)}  # старые потоки закроет mpv
         self.command("loadfile", f"jpgsvid://{key}")
 
     def stop(self):
