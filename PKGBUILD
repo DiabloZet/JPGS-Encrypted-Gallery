@@ -1,6 +1,6 @@
 # Локальная сборка: в этой папке выполнить  makepkg -si
 pkgname=jpgs
-pkgver=2.5.0
+pkgver=2.5.1
 pkgrel=1
 pkgdesc="Просмотр зашифрованных изображений .jpgs и видео .vids (GTK4, Wayland, libmpv/FFmpeg)"
 arch=('any')

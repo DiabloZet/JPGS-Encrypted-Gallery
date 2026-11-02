@@ -228,7 +228,8 @@ class VideoPane(Gtk.Overlay):
 
     def _seek_changed(self, scale, scroll, value):
         if self.player is not None:
-            self.player.command("seek", f"{max(0.0, value):.3f}", "absolute")
+            # точная перемотка: в WebM без индекса ключевые кадры редки и «по ключевому» промахивается
+            self.player.command("seek", f"{max(0.0, value):.3f}", "absolute", "exact")
         return False
 
     # ------------------------------------------------------------------ события mpv

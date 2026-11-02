@@ -4,7 +4,7 @@
   * текущее изображение, декодированное под размер экрана (+ полное — только при увеличении);
   * соседние (предыдущее/следующее) — тоже под размер экрана, для мгновенного листания;
   * сжатые JPEG-байты последних просмотренных кадров (LRU, ≤ 64 МБ);
-  * миниатюры видимой ленты (LRU, ~150 шт.).
+  * миниатюры видимой части ленты (+ по 20 с каждой стороны).
 Расшифрованные данные никогда не пишутся на диск (кроме явного «Сохранить»/«Расшифровать»).
 """
 
@@ -38,7 +38,7 @@ from .video_ui import VideoPane, fmt_time  # noqa: E402
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
 BYTES_CACHE_LIMIT = 64 * 1024 * 1024
-THUMB_LIMIT = 150
+THUMB_MARGIN = 20   # сколько миниатюр держать загруженными за краями видимой части ленты
 THUMB_SIDE = 192
 EDGE_CLICK = 100
 ZOOM_MAX = 20.0
@@ -384,6 +384,7 @@ class FileItem(GObject.Object):
         self.jf = jf
         self.gen = gen          # поколение ленты: после пересборки старые миниатюры не нужны
         self.ii = ii
+        self.failed = False     # миниатюру не удалось сделать — не повторять при прокрутке
 
 
 # ---------------------------------------------------------------------------
@@ -412,9 +413,11 @@ class JpgsWindow(Adw.ApplicationWindow):
         self.bytes_lock = threading.Lock()
         self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jpgs-load")
         self.thumb_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jpgs-thumb")
-        self.thumb_lru: OrderedDict[int, FileItem] = OrderedDict()
-        self.thumb_queue: list[FileItem] = []
-        self.thumb_pending: set[int] = set()
+        self.thumb_loaded: set[int] = set()        # позиции ленты с загруженной миниатюрой
+        self.thumb_queue: list[FileItem] = []       # очередь загрузки (pop() — самая нужная)
+        self.thumb_pending: set[int] = set()        # в очереди или загружается сейчас
+        self.thumb_window = (0, -1)                 # [от, до] — что держим загруженным
+        self._thumb_refresh_src = 0
         self.thumb_lock = threading.Lock()
         self.strip_gen = 0
         self.strip_fi: Optional[int] = None   # чьи кадры сейчас в ленте (режим «кадры»)
@@ -588,6 +591,9 @@ class JpgsWindow(Adw.ApplicationWindow):
         sc = Gtk.ScrolledWindow(child=self.strip, vscrollbar_policy=Gtk.PolicyType.NEVER,
                                 hscrollbar_policy=Gtk.PolicyType.AUTOMATIC, min_content_height=96)
         self.strip_sw = sc
+        hadj = sc.get_hadjustment()
+        hadj.connect("value-changed", lambda *_: self._schedule_thumbs())
+        hadj.connect("changed", lambda *_: self._schedule_thumbs())
         # колёсико мыши (вертикальное) прокручивает горизонтальную ленту
         strip_scroll = Gtk.EventControllerScroll(
             flags=Gtk.EventControllerScrollFlags.BOTH_AXES)
@@ -823,6 +829,7 @@ class JpgsWindow(Adw.ApplicationWindow):
         if on and not self.strip_revealer.get_reveal_child():
             self.strip_revealer.set_reveal_child(True)
             GLib.idle_add(lambda: self._scroll_strip() and False)
+            self._schedule_thumbs()
         else:
             self.strip_revealer.set_reveal_child(on)
 
@@ -847,7 +854,8 @@ class JpgsWindow(Adw.ApplicationWindow):
         with self.thumb_lock:
             self.thumb_queue.clear()
             self.thumb_pending.clear()
-            self.thumb_lru.clear()
+        self.thumb_loaded.clear()
+        self._schedule_thumbs()
         self.store.remove_all()
         if not self.files:
             self.strip_fi = None
@@ -1019,9 +1027,9 @@ class JpgsWindow(Adw.ApplicationWindow):
             if item is not None:
                 item.thumb = None
                 item.badge = ""
-                with self.thumb_lock:
-                    self.thumb_lru.pop(fi, None)
-                self._queue_thumb(item)
+                item.failed = False
+                self.thumb_loaded.discard(fi)
+                self._schedule_thumbs()
         self.show(fi, goto_ii)
 
     def _reload_folder(self, select_path: Optional[str], ii: int = 0):
@@ -2051,22 +2059,13 @@ class JpgsWindow(Adw.ApplicationWindow):
         ]
         ov.set_tooltip_text(item.jf.name if item.ii is None else f"Кадр {item.ii + 1}")
         if item.thumb is None:
-            self._queue_thumb(item)
-        else:
-            with self.thumb_lock:
-                if item.index in self.thumb_lru:
-                    self.thumb_lru.move_to_end(item.index)
+            self._schedule_thumbs()
 
     def _thumb_unbind(self, fac, li):
         ov = li.get_child()
         for obj, h in ov.handlers:
             obj.disconnect(h)
         ov.handlers = []
-        item = li.get_item()
-        with self.thumb_lock:
-            if item in self.thumb_queue:
-                self.thumb_queue.remove(item)
-                self.thumb_pending.discard(item.index)
 
     def _thumb_menu(self, gesture, n, x, y, ov):
         """Правый клик по миниатюре: открыть эту запись и показать меню JPGS для неё."""
@@ -2090,13 +2089,61 @@ class JpgsWindow(Adw.ApplicationWindow):
         ov.badge.set_visible(bool(text))
         ov.badge.set_text(text or "")
 
-    def _queue_thumb(self, item: FileItem):
+    # --- какие миниатюры держать в памяти: видимые + THUMB_MARGIN с каждой стороны
+
+    def _schedule_thumbs(self):
+        """Пересчитать загружаемые миниатюры чуть позже (прокрутка шлёт много событий)."""
+        if not self._thumb_refresh_src:
+            self._thumb_refresh_src = GLib.timeout_add(40, self._refresh_thumbs)
+
+    def _visible_range(self) -> tuple[int, int]:
+        """Позиции ленты, которые сейчас видны (по прокрутке); без ленты — вокруг текущей."""
+        n = self.store.get_n_items()
+        if not n:
+            return 0, -1
+        adj = self.strip_sw.get_hadjustment()
+        upper, page, value = adj.get_upper(), adj.get_page_size(), adj.get_value()
+        if upper <= 0 or page <= 0 or not self.strip_revealer.get_reveal_child():
+            pos = self._strip_pos()
+            c = pos if pos != Gtk.INVALID_LIST_POSITION else 0
+            return max(0, c - 5), min(n - 1, c + 5)
+        per = upper / n  # ширина одной миниатюры (все одинаковые)
+        first = int(value / per)
+        last = int((value + page - 1) / per)
+        return max(0, first), min(n - 1, last)
+
+    def _refresh_thumbs(self):
+        self._thumb_refresh_src = 0
+        n = self.store.get_n_items()
+        first, last = self._visible_range()
+        lo, hi = max(0, first - THUMB_MARGIN), min(n - 1, last + THUMB_MARGIN)
+        self.thumb_window = (lo, hi)
+        # выгрузить всё, что ушло далеко за край
+        for k in [k for k in self.thumb_loaded if not lo <= k <= hi]:
+            self.thumb_loaded.discard(k)
+            if k < n:
+                self.store.get_item(k).thumb = None
+        # нужные: сначала видимые, потом всё дальше от краёв
+        order = list(range(first, last + 1))
+        for d in range(1, THUMB_MARGIN + 1):
+            order += [k for k in (first - d, last + d) if lo <= k <= hi]
         with self.thumb_lock:
-            if item.index in self.thumb_pending:
-                return
-            self.thumb_pending.add(item.index)
-            self.thumb_queue.append(item)
-        self.thumb_pool.submit(self._thumb_job, self.files)
+            busy = self.thumb_pending - {it.index for it in self.thumb_queue}  # загружаются
+            want = []
+            for k in order:
+                if 0 <= k < n and k not in busy:
+                    it = self.store.get_item(k)
+                    if it.thumb is None and not getattr(it, "failed", False):
+                        want.append(it)
+            added = len(want) - len(self.thumb_queue)
+            self.thumb_queue[:] = list(reversed(want))  # pop() берёт самую нужную
+            self.thumb_pending = busy | {it.index for it in want}
+        try:
+            for _ in range(max(0, added)):
+                self.thumb_pool.submit(self._thumb_job, self.files)
+        except RuntimeError:  # окно закрывается, пул остановлен
+            pass
+        return False
 
     def _thumb_job(self, files_ref):
         with self.thumb_lock:
@@ -2122,6 +2169,7 @@ class JpgsWindow(Adw.ApplicationWindow):
             def failed():
                 if item.gen == self.strip_gen:
                     self.thumb_pending.discard(item.index)
+                    item.failed = True  # не пытаться снова при каждой прокрутке
                     if item.jf.is_video or (item.ii is not None and item.jf.kind(item.ii) == "video"):
                         item.badge = self._frame_badge(item, "▶")
                 return False
@@ -2129,35 +2177,34 @@ class JpgsWindow(Adw.ApplicationWindow):
             return
         GLib.idle_add(self._thumb_done, files_ref, item, dec)
 
+    def _keep_thumb(self, item) -> bool:
+        """Миниатюра всё ещё нужна (не уехала за пределы окна, пока грузилась)."""
+        self.thumb_pending.discard(item.index)
+        lo, hi = self.thumb_window
+        if lo <= item.index <= hi:
+            self.thumb_loaded.add(item.index)
+            return True
+        return False
+
     def _video_thumb_done(self, files_ref, item, pb, info):
         if files_ref is not self.files or item.gen != self.strip_gen:
             return False
-        self.thumb_pending.discard(item.index)
+        play = "▶ " + fmt_time(info.duration) if info.duration else "▶"
+        item.badge = self._frame_badge(item, play)  # подпись нужна и без картинки
+        if not self._keep_thumb(item):
+            return False
         fmt = Gdk.MemoryFormat.R8G8B8A8 if pb.get_has_alpha() else Gdk.MemoryFormat.R8G8B8
         item.thumb = Gdk.MemoryTexture.new(pb.get_width(), pb.get_height(), fmt,
                                            pb.read_pixel_bytes(), pb.get_rowstride())
-        play = "▶ " + fmt_time(info.duration) if info.duration else "▶"
-        item.badge = self._frame_badge(item, play)
-        with self.thumb_lock:
-            self.thumb_lru[item.index] = item
-            while len(self.thumb_lru) > THUMB_LIMIT:
-                _i, old = self.thumb_lru.popitem(last=False)
-                old.thumb = None
         return False
 
     def _thumb_done(self, files_ref, item, dec):
         if files_ref is not self.files or item.gen != self.strip_gen:
             return False
-        self.thumb_pending.discard(item.index)
-        item.thumb = dec.texture()
         if item.ii is not None:
             item.badge = self._frame_badge(item, "")
-        with self.thumb_lock:
-            self.thumb_lru[item.index] = item
-            self.thumb_lru.move_to_end(item.index)
-            while len(self.thumb_lru) > THUMB_LIMIT:
-                _i, old = self.thumb_lru.popitem(last=False)
-                old.thumb = None
+        if self._keep_thumb(item):
+            item.thumb = dec.texture()
         return False
 
     def _strip_pos(self) -> int:
@@ -2694,6 +2741,9 @@ class JpgsWindow(Adw.ApplicationWindow):
         self.strip_popover.unparent()
         self.video.destroy()
         self.app.settings.set("volume", self.app.settings.get("volume"))
+        if self._thumb_refresh_src:
+            GLib.source_remove(self._thumb_refresh_src)
+            self._thumb_refresh_src = 0
         self.pool.shutdown(wait=False, cancel_futures=True)
         self.thumb_pool.shutdown(wait=False, cancel_futures=True)
         return False

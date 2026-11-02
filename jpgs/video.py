@@ -43,6 +43,53 @@ def _open_src(path: str, cipher: Cipher, entry=None) -> "C.DecryptedFile":
     return C.DecryptedFile(path, cipher, entry.start, entry.length)
 
 
+_DUR_CACHE: dict[tuple, float] = {}
+_DUR_LOCK = threading.Lock()
+
+
+def _dur_key(path: str, entry) -> Optional[tuple]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (path, st.st_size, st.st_mtime_ns, entry.start if entry is not None else -1)
+
+
+def _scan_duration(ct, vs) -> float:
+    """Длительность по последнему пакету видео — для файлов, где она не записана.
+
+    Так бывает у WebM/MKV, записанных «потоком» (браузер, OBS, запись экрана): индекса и
+    длительности в заголовке нет. Кадры не декодируются — только перебираются пакеты.
+    """
+    tb = vs.time_base
+    start = float(vs.start_time * tb) if vs.start_time is not None and tb else 0.0
+    end = 0.0
+    for pkt in ct.demux(vs):
+        if pkt.pts is None or not tb:
+            continue
+        t = float((pkt.pts + (pkt.duration or 0)) * tb)
+        if t > end:
+            end = t
+    return max(0.0, end - start)
+
+
+def video_duration(path: str, cipher: Cipher, entry=None) -> float:
+    """Длительность видео в секундах (0 — не удалось); результат кэшируется."""
+    key = _dur_key(path, entry)
+    with _DUR_LOCK:
+        if key in _DUR_CACHE:
+            return _DUR_CACHE[key]
+    import av
+    with _open_src(path, cipher, entry) as f, av.open(f, mode="r") as ct:
+        dur = float(ct.duration) / 1e6 if ct.duration else 0.0
+        if not dur and ct.streams.video:
+            dur = _scan_duration(ct, ct.streams.video[0])
+    if key is not None:
+        with _DUR_LOCK:
+            _DUR_CACHE[key] = dur
+    return dur
+
+
 def grab_frame(path: str, cipher: Cipher, max_side: Optional[int] = 256,
                at: Optional[float] = None, entry=None):
     """(pixels: bytes, w, h, stride, info) — кадр из зашифрованного видео.
@@ -56,6 +103,10 @@ def grab_frame(path: str, cipher: Cipher, max_side: Optional[int] = 256,
         vs = ct.streams.video[0]
         vs.thread_type = "AUTO"
         dur = float(ct.duration) / 1e6 if ct.duration else 0.0
+        key = _dur_key(path, entry)
+        if not dur:
+            with _DUR_LOCK:
+                dur = _DUR_CACHE.get(key, 0.0)
         if at is not None:
             target = max(0.0, at)
         else:
@@ -81,6 +132,15 @@ def grab_frame(path: str, cipher: Cipher, max_side: Optional[int] = 256,
             tw, th = w, h
         rgb = frame.reformat(width=tw, height=th, format="rgb24")
         plane = rgb.planes[0]
+        if not dur and at is None:
+            # длительности в файле нет — досчитать по последнему пакету (для подписи «▶ 1:23»)
+            try:
+                dur = _scan_duration(ct, vs)
+            except av.error.FFmpegError:
+                dur = 0.0
+            if key is not None:
+                with _DUR_LOCK:
+                    _DUR_CACHE[key] = dur
         info = VideoInfo(w, h, dur, rot)
         if rot in (90, 270):
             info.width, info.height = h, w
@@ -268,6 +328,9 @@ class MpvPlayer:
             "audio-client-name": "JPGS", "terminal": "no", "msg-level": "all=error",
             "save-position-on-quit": "no",
             "ytdl": "no", "load-scripts": "no", "config": "no",
+            # WebM/MKV без индекса (запись из браузера, OBS): длительность — по последним
+            # кадрам в конце файла, иначе ползунок упирается в уже прочитанное
+            "demuxer-mkv-probe-video-duration": "yes",
             **(dict(x.split("=", 1) for x in os.environ["JPGS_MPV_OPTS"].split(","))
                if os.environ.get("JPGS_MPV_OPTS") else {}),
         }

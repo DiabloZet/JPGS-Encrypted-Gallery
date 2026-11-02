@@ -376,13 +376,11 @@ def _run(job: Job, args: list[str], stdin_data: Optional[bytes], duration: float
 
 
 def probe_duration(jf: C.JpgsFile, ii: int) -> float:
-    """Длительность видео (для процентов) через PyAV; 0 — неизвестно."""
+    """Длительность видео (для процентов); 0 — неизвестно. Досчитывается и для WebM без
+    записанной длительности."""
     try:
-        import av
-        e = None if jf.is_video else jf.entry(ii)
-        from .video import _open_src
-        with _open_src(jf.path, jf.cipher, e) as f, av.open(f, mode="r") as ct:
-            return float(ct.duration) / 1e6 if ct.duration else 0.0
+        from .video import video_duration
+        return video_duration(jf.path, jf.cipher, None if jf.is_video else jf.entry(ii))
     except Exception:  # noqa: BLE001
         return 0.0
 
