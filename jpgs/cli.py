@@ -13,6 +13,7 @@
     jpgs pack АРХИВ.jpgs ФАЙЛЫ…     картинки и видео (и другие .jpgs/.vids) в один архив
     jpgs note ФАЙЛ [N] [ТЕКСТ]      показать / задать заметку к записи N (с 1)
     jpgs lock                       забыть запомненный пароль
+    jpgs fix-video ФАЙЛЫ…            WebM/MKV без индекса: перепаковать, чтобы перематывались
 
 Файлы открываются любым ключом из хранилища — нужный подбирается сам.
 """
@@ -29,7 +30,7 @@ from .crypto import (DEFAULT_KIND, Cipher, KeyLocked, KeyMissing, KeyRing, finge
                      generate_key, key_strength, material_for)
 
 COMMANDS = ("?", "encryptor", "merge", "decoder", "recovery", "encrypt", "decrypt", "info",
-            "thumbnail", "set-key", "key", "keys", "pack", "note", "lock")
+            "thumbnail", "set-key", "key", "keys", "pack", "note", "lock", "fix-video")
 
 HELP = ("Command:\n"
         "1. encryptor - Encrypt file to jpg format.\n"
@@ -38,6 +39,7 @@ HELP = ("Command:\n"
         "4. recovery - Recovering possible data from a damaged file.\n"
         "Extra: encrypt FILES [-o DIR] [--remove], decrypt FILES [-o DIR], info FILES\n"
         "       pack OUT.jpgs FILES (images + videos in one archive), note FILE [N] [TEXT], lock\n"
+        "       fix-video FILES (make WebM/MKV without index seekable, lossless)\n"
         "Videos: encryptor/encrypt produce .vids, decoder/decrypt restore the original video\n"
         "Key: jpgs set-key [--generate | --stdin | --legacy]  |  jpgs key  (fingerprint)\n"
         "Keys: jpgs keys [list | add | remove | use | rename | passwd | upgrade | rekey]\n"
@@ -490,6 +492,34 @@ def _main(cmd: str, rest: list[str]) -> int:
                 print("Проверка не прошла — оригиналы НЕ удалены.", file=sys.stderr)
                 return 1
         return 0
+
+    if cmd == "fix-video":
+        from . import transcode as T
+        if not rest:
+            print("Укажите файлы: jpgs fix-video *.vids *.jpgs", file=sys.stderr)
+            return 1
+        if not T.ffmpeg_path():
+            print("Нужен FFmpeg.", file=sys.stderr)
+            return 1
+        rc = 0
+        for p in rest:
+            c = _cipher_or_skip(ring, p)
+            if c is None:
+                rc = 1
+                continue
+            jf = C.open_media(p, c)
+            fixed = 0
+            for k in range(jf.count()):
+                jf = C.open_media(p, c)  # после замены записи файл другой
+                if (jf.is_video or jf.kind(k) == "video") and T.needs_index_repair(jf, k):
+                    try:
+                        T.repair_index(jf, k, T.Job())
+                        fixed += 1
+                    except T.TranscodeError as e:
+                        print(f"{p} [{k + 1}]: {e}", file=sys.stderr)
+                        rc = 1
+            print(f"{p}: исправлено видео — {fixed}" if fixed else f"{p}: исправлять нечего")
+        return rc
 
     if cmd == "note":
         ap = argparse.ArgumentParser(prog="jpgs note", description="Заметка к записи файла")

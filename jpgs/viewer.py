@@ -418,6 +418,8 @@ class JpgsWindow(Adw.ApplicationWindow):
         self.thumb_pending: set[int] = set()        # в очереди или загружается сейчас
         self.thumb_window = (0, -1)                 # [от, до] — что держим загруженным
         self._thumb_refresh_src = 0
+        self._needs_fix: set[tuple] = set()      # (путь, запись) WebM/MKV без индекса
+        self._fix_offered: set[tuple] = set()    # кому уже предлагали исправить
         self.thumb_lock = threading.Lock()
         self.strip_gen = 0
         self.strip_fi: Optional[int] = None   # чьи кадры сейчас в ленте (режим «кадры»)
@@ -668,6 +670,7 @@ class JpgsWindow(Adw.ApplicationWindow):
         add("show-in-folder", self.show_in_folder)
         add("properties", self.properties_dialog)
         add("video-frame", self.save_video_frame)
+        add("video-fix-index", self.fix_video_index)
         add("rekey-file", self.rekey_current)
         add("rekey-folder", self.rekey_folder)
         add("note-edit", self.note_edit)
@@ -804,6 +807,7 @@ class JpgsWindow(Adw.ApplicationWindow):
         self._enable("transcode", has and (shown or is_video))
         self._enable("rekey-folder", has)
         self._enable("video-frame", is_video)
+        self._enable("video-fix-index", is_video and self._cur_needs_fix())
         self._enable("speed", is_video)
         self.zoom_btn.set_sensitive(shown)
         if not shown:
@@ -1352,6 +1356,68 @@ class JpgsWindow(Adw.ApplicationWindow):
             return
         self.run_bg("Сохранение кадра…", work, done)
 
+    # ---------------------------------------------------------------- WebM без индекса перемотки
+
+    def _cur_needs_fix(self) -> bool:
+        if not self.files:
+            return False
+        return (self.files[self.fi].path, self.ii) in self._needs_fix
+
+    def _check_index(self, jf, fi, ii):
+        """WebM/MKV без индекса (запись «потоком», старая конвертация) перематывается плохо:
+        проверить в фоне и предложить перепаковать — без перекодирования, в памяти."""
+        key = (jf.path, ii)
+        if key in self._fix_offered:
+            return
+        from . import transcode as T
+
+        def job():
+            need = T.ffmpeg_path() is not None and T.needs_index_repair(jf, ii)
+            GLib.idle_add(lambda: done(need) and False)
+
+        def done(need):
+            if not need:
+                return
+            self._needs_fix.add(key)
+            self._fix_offered.add(key)
+            if self.files and self.files[self.fi] is jf and self.ii == ii:
+                self._update_actions()
+                t = Adw.Toast(title="В видео нет индекса — перемотка работает плохо",
+                              button_label="Исправить", timeout=10)
+                t.connect("button-clicked", lambda *_: self.fix_video_index())
+                self.toasts.add_toast(t)
+        threading.Thread(target=job, daemon=True).start()
+
+    def fix_video_index(self):
+        """Перепаковать текущее видео с индексом перемотки и длительностью (качество то же)."""
+        if not self._cur_is_video():
+            return
+        from . import transcode as T
+        jf, fi, ii = self.files[self.fi], self.fi, self.ii
+        job = T.Job()
+        toast = Adw.Toast(title="Исправление перемотки…", timeout=0, button_label="Отмена")
+        toast.connect("button-clicked", lambda *_: job.cancel())
+        self.toasts.add_toast(toast)
+        self.video.stop()  # файл будет заменён
+
+        def work():
+            try:
+                res, err = T.repair_index(jf, ii, job), None
+            except Exception as e:  # noqa: BLE001
+                res, err = None, e
+            GLib.idle_add(lambda: finished(res, err) and False)
+
+        def finished(res, err):
+            toast.dismiss()
+            if err is None:
+                self._needs_fix.discard((jf.path, ii))
+                self.toast("Готово: теперь видео перематывается в любое место")
+            else:
+                self.toast("Отменено" if job.cancelled else f"Не удалось: {err}")
+            if fi < len(self.files):
+                self._file_changed(fi, ii)
+        threading.Thread(target=work, daemon=True).start()
+
     # ---------------------------------------------------------------- FFmpeg: сжатие/конвертация
 
     def transcode_dialog(self):
@@ -1665,6 +1731,8 @@ class JpgsWindow(Adw.ApplicationWindow):
             s2 = Gio.Menu()
             s2.append("Заметка…", "win.note-edit")
             s2.append("Сжать / конвертировать…", "win.transcode")
+            if self._cur_needs_fix():
+                s2.append("Исправить перемотку (без потери качества)", "win.video-fix-index")
             s2.append("Сохранить текущий кадр как PNG…", "win.video-frame")
             s2.append("Сохранить расшифрованную копию…", "win.save-as")
             menu.append_section(None, s2)
@@ -1802,6 +1870,8 @@ class JpgsWindow(Adw.ApplicationWindow):
         else:
             if not self.video.play(jf.path, jf.cipher, entry, ext):
                 self._video_error(self.video.error or "Видео недоступно")
+            elif ext in ("webm", "mkv"):
+                self._check_index(jf, fi, ii)
         self._update_note()
         self._sync_strip()
         self._update_title()

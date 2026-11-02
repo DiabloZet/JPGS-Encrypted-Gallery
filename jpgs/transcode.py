@@ -7,7 +7,11 @@
     адреса сервер отвечает 404, после конвертации сразу закрывается;
   * картинка: целиком через stdin (она небольшая);
   * результат FFmpeg пишет в stdout (mp4 — фрагментированный, чтобы не нужна была
-    перемотка вывода), программа сразу шифрует его в новый файл.
+    перемотка вывода), программа сразу шифрует его в новый файл;
+  * WebM/MKV так писать нельзя: индекс перемотки (Cues) и длительность муксер дописывает,
+    возвращаясь в начало файла, а в канал вернуться нельзя — получилось бы видео, которое
+    плееры не умеют перематывать. Поэтому для них FFmpeg пишет в анонимный файл в памяти
+    (memfd: без имени, на диск не попадает), а после — программа шифрует его содержимое.
 
 Открытые данные живут только в памяти этого процесса и FFmpeg.
 """
@@ -99,6 +103,7 @@ class VideoOpts:
     audio: bool = True
     start: Optional[float] = None        # обрезка, секунды
     end: Optional[float] = None
+    need_index: bool = False             # только перепаковка ради индекса — нужен memfd
 
     @property
     def ext(self) -> Optional[str]:
@@ -309,17 +314,42 @@ class Job:
                 pass
 
 
+def memory_budget() -> int:
+    """Сколько байт результата можно держать в памяти (memfd): половина доступной ОЗУ.
+    0 — memfd недоступен (не Linux)."""
+    if not hasattr(os, "memfd_create"):
+        return 0
+    try:
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024 // 2
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
 def _run(job: Job, args: list[str], stdin_data: Optional[bytes], duration: float,
-         progress: Progress) -> Iterator[bytes]:
-    """Запустить FFmpeg и отдавать его stdout кусками; прогресс — из -progress."""
+         progress: Progress, out_fd: Optional[int] = None) -> Iterator[bytes]:
+    """Запустить FFmpeg и отдавать результат кусками; прогресс — из -progress.
+
+    out_fd — memfd, куда FFmpeg пишет результат как в обычный файл (с перемоткой); его
+    содержимое отдаётся после завершения FFmpeg. Без него — stdout (args кончаются pipe:1).
+    """
     exe = ffmpeg_path()
     if not exe:
         raise TranscodeError("FFmpeg не найден — установите пакет ffmpeg")
     cmd = [exe, "-hide_banner"] + (["-nostdin"] if stdin_data is None else []) + \
         ["-loglevel", "error", "-progress", "pipe:2", "-nostats"] + args
+    if out_fd is not None:
+        # -y обязателен: без него FFmpeg считает /dev/fd/N «уже существующим файлом»,
+        # ничего не пишет — и выходит с кодом 0, как будто всё получилось
+        cmd += ["-y", f"/dev/fd/{out_fd}"]
     job.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if stdin_data is not None else
-                                subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE)
+                                subprocess.DEVNULL,
+                                stdout=subprocess.PIPE if out_fd is None else subprocess.DEVNULL,
+                                stderr=subprocess.PIPE,
+                                pass_fds=(out_fd,) if out_fd is not None else ())
     proc = job.proc
 
     def feed():
@@ -348,12 +378,16 @@ def _run(job: Job, args: list[str], stdin_data: Optional[bytes], duration: float
     w.start()
     eof = False
     try:
-        while True:
-            b = proc.stdout.read(C.CHUNK)
-            if not b:
-                eof = True
-                break
-            yield b
+        if out_fd is None:
+            while True:
+                b = proc.stdout.read(C.CHUNK)
+                if not b:
+                    eof = True
+                    break
+                yield b
+        else:
+            proc.wait()
+            eof = True
     finally:
         if not eof and proc.poll() is None:
             # потребитель бросил чтение (ошибка записи результата) — не оставлять FFmpeg висеть
@@ -365,7 +399,8 @@ def _run(job: Job, args: list[str], stdin_data: Optional[bytes], duration: float
         w.join(timeout=5)
         for pipe in (proc.stdout, proc.stderr):
             try:
-                pipe.close()
+                if pipe is not None:
+                    pipe.close()
             except OSError:
                 pass
     if job.cancelled:
@@ -373,6 +408,14 @@ def _run(job: Job, args: list[str], stdin_data: Optional[bytes], duration: float
     if rc != 0:
         tail = "; ".join(job.stderr_tail[-3:]) or f"код {rc}"
         raise TranscodeError(f"FFmpeg: {tail}")
+    if out_fd is not None:
+        pos = 0
+        while True:
+            b = os.pread(out_fd, C.CHUNK, pos)
+            if not b:
+                break
+            pos += len(b)
+            yield b
 
 
 def probe_duration(jf: C.JpgsFile, ii: int) -> float:
@@ -418,11 +461,40 @@ def transcode_video(jf: C.JpgsFile, ii: int, o: VideoOpts, replace: bool, job: J
         duration = o.end - (o.start or 0)
     elif o.start and duration:
         duration -= o.start
-    with _SourceServer(jf.path, jf.cipher, entry) as srv:
-        pre = ["-ss", f"{o.start:.3f}"] if o.start else []
-        args = pre + ["-i", srv.url] + video_args(o) + output_args(mux) + ["pipe:1"]
-        chunks = _run(job, args, None, duration, progress)
-        return _store(jf, ii, "video", ext, chunks, replace, before)
+    # WebM/MKV — через файл в памяти, чтобы муксер записал индекс перемотки и длительность
+    use_mem = mux in ("webm", "matroska") and memory_budget() > before * 1.5 + (64 << 20)
+    if o.need_index and not use_mem:
+        raise TranscodeError("не хватает свободной памяти, чтобы перепаковать это видео")
+    fd = os.memfd_create("jpgs-transcode", os.MFD_CLOEXEC) if use_mem else None
+    try:
+        with _SourceServer(jf.path, jf.cipher, entry) as srv:
+            pre = ["-ss", f"{o.start:.3f}"] if o.start else []
+            args = pre + ["-i", srv.url] + video_args(o) + output_args(mux)
+            if fd is None:
+                args.append("pipe:1")
+            chunks = _run(job, args, None, duration, progress, fd)
+            return _store(jf, ii, "video", ext, chunks, replace, before)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def needs_index_repair(jf: C.JpgsFile, ii: int) -> bool:
+    """WebM/MKV без индекса перемотки и длительности (запись «потоком», старая конвертация)."""
+    try:
+        if jf.video_ext(ii) not in ("webm", "mkv"):
+            return False
+        from .video import has_container_duration
+        return not has_container_duration(jf.path, jf.cipher, None if jf.is_video else jf.entry(ii))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def repair_index(jf: C.JpgsFile, ii: int, job: Job, progress: Progress = None) -> Result:
+    """Перепаковать WebM/MKV без перекодирования (качество то же), записав индекс перемотки
+    и длительность. Заменяет запись; заметка сохраняется."""
+    o = VideoOpts(fmt="copy", need_index=True)
+    return transcode_video(jf, ii, o, True, job, progress)
 
 
 def transcode_image(jf: C.JpgsFile, ii: int, o: ImageOpts, replace: bool, job: Job,
@@ -486,6 +558,28 @@ def _upright_png(data: bytes, keep_alpha: bool) -> bytes:
     return bytes(buf)
 
 
+def _validate(path: str, cipher: Cipher, kind: str, length: int):
+    """Результат должен быть не пустым и читаемым — иначе оригинал не трогаем."""
+    if length <= 0:
+        raise TranscodeError("FFmpeg вернул пустой результат — оригинал не изменён")
+    jf = C.open_media(path, cipher)
+    try:
+        if kind == "image":
+            from .imaging import decode
+            decode(jf.read_image(0), 64)
+            return
+        try:
+            import av  # noqa: F401
+        except ImportError:
+            return  # без PyAV проверить нечем; длина уже не нулевая
+        from .video import grab_frame
+        grab_frame(path, cipher, 32, at=0.0)
+    except TranscodeError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise TranscodeError(f"результат не читается ({e}) — оригинал не изменён") from None
+
+
 def _store(jf: C.JpgsFile, ii: int, kind: str, ext: str, chunks, replace: bool,
            before: int) -> Result:
     """Зашифровать результат: заменить запись (в архиве или .vids) либо новым файлом рядом."""
@@ -507,7 +601,15 @@ def _store(jf: C.JpgsFile, ii: int, kind: str, ext: str, chunks, replace: bool,
         except OSError:
             pass
         raise
-    after = C.open_media(tmp, jf.cipher).entry(0).length
+    try:
+        after = C.open_media(tmp, jf.cipher).entry(0).length
+        _validate(tmp, jf.cipher, kind, after)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     if not replace:
         return Result(tmp, 0, before, after)
     try:
