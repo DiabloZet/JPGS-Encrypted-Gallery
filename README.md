@@ -149,6 +149,7 @@ jpgs info *.jpgs *.vids
 jpgs pack архив.jpgs a.jpg clip.mp4 b.jpgs [--remove]   # картинки и видео в один архив
 jpgs note файл.jpgs [N] ["текст"]               # показать / задать заметку к записи N
 jpgs lock                                       # забыть запомненный пароль
+jpgs fix-video ФАЙЛЫ…                           # WebM/MKV без индекса → перематываются
 jpgs encryptor | merge | decoder | recovery   # пакетные команды для текущей папки
 jpgs set-key [--generate | --stdin]  ·  jpgs key
 jpgs keys list | add [--legacy | --pbkdf2] | remove <id> | use <id> | rename <id> ИМЯ | passwd [--remove]
@@ -206,6 +207,10 @@ jpgs keys rekey ФАЙЛЫ --to <id>               # перешифровать 
 - **Нет миниатюр видео** — установите `python-av`, затем `rm -rf ~/.cache/thumbnails/fail`.
 - **KDE: нет пунктов меню / миниатюр** — `kbuildsycoca6 --noincremental`,
   `systemctl --user restart plasma-plasmashell`; в настройках предпросмотра Dolphin поднимите лимит размера файла.
+- **WebM/MKV не перематывается** (перескакивает в конец; так бывает у записей из браузера, OBS,
+  записи экрана — в них нет индекса) — нажмите «Исправить» в появившемся уведомлении или
+  правый клик → «Исправить перемотку»; для многих файлов сразу: `jpgs fix-video *.vids *.jpgs`.
+  Видео перепаковывается без перекодирования, качество не меняется.
 - Отладка видео: `JPGS_MPV_LOG=/tmp/mpv.log jpgs файл.vids`.
 
 ## Разработка

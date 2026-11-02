@@ -73,6 +73,24 @@ def _scan_duration(ct, vs) -> float:
     return max(0.0, end - start)
 
 
+_HAS_DUR: dict[tuple, bool] = {}
+
+
+def has_container_duration(path: str, cipher: Cipher, entry=None) -> bool:
+    """Записана ли длительность в самом файле (у WebM без индекса её нет). Кэшируется."""
+    key = _dur_key(path, entry)
+    with _DUR_LOCK:
+        if key in _HAS_DUR:
+            return _HAS_DUR[key]
+    import av
+    with _open_src(path, cipher, entry) as f, av.open(f, mode="r") as ct:
+        has = bool(ct.duration)
+    if key is not None:
+        with _DUR_LOCK:
+            _HAS_DUR[key] = has
+    return has
+
+
 def video_duration(path: str, cipher: Cipher, entry=None) -> float:
     """Длительность видео в секундах (0 — не удалось); результат кэшируется."""
     key = _dur_key(path, entry)

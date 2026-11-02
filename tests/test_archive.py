@@ -336,6 +336,55 @@ class TranscodeTests(unittest.TestCase):
         self.assertAlmostEqual(info.duration, 6.0, delta=0.2)
         self.assertAlmostEqual(video_duration(vids, self.c), 6.0, delta=0.2)
 
+    def test_repair_index_of_live_webm(self):
+        """WebM без индекса перепаковывается без перекодирования: перемотка и длительность."""
+        import importlib.util
+        import subprocess
+        if importlib.util.find_spec("av") is None:
+            self.skipTest("нет PyAV")
+        from jpgs import transcode as T
+        from jpgs.video import has_container_duration
+        live = os.path.join(self.d, "live.webm")
+        with open(live, "wb") as f:
+            subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+                            "testsrc2=size=160x120:rate=25", "-t", "5", "-c:v", "libvpx",
+                            "-f", "webm", "-live", "1", "-"], check=True, stdout=f)
+        vids = C.encrypt_stream(live, self.d, self.c)
+        os.remove(live)
+        C.set_note(vids, 0, "n", self.c)
+        jf = C.VidsFile(vids, self.c)
+        self.assertTrue(T.needs_index_repair(jf, 0))
+        before = set(os.listdir(self.d))
+        T.repair_index(jf, 0, T.Job())
+        self.assertEqual(set(os.listdir(self.d)), before)  # ничего открытого на диске
+        jf = C.VidsFile(vids, self.c)
+        self.assertFalse(T.needs_index_repair(jf, 0))
+        self.assertEqual(jf.note(0), "n")
+        self.assertTrue(has_container_duration(vids, self.c))
+
+    def test_converted_webm_has_duration(self):
+        from jpgs import transcode as T
+        from jpgs.video import has_container_duration
+        vids = C.encrypt_stream(self.src, self.d, self.c)
+        r = T.transcode_video(C.VidsFile(vids, self.c), 0,
+                              T.VideoOpts(fmt="webm-vp9", quality="low", max_height=120),
+                              False, T.Job())
+        self.assertTrue(has_container_duration(r.path, self.c))
+
+    def test_empty_result_never_replaces_original(self):
+        from jpgs import transcode as T
+        vids = C.encrypt_stream(self.src, self.d, self.c)
+        with open(vids, "rb") as f:
+            orig = f.read()
+        with self.assertRaises(T.TranscodeError):
+            T._store(C.VidsFile(vids, self.c), 0, "video", "mp4", iter([b""]), True, len(orig))
+        with self.assertRaises(T.TranscodeError):
+            T._store(C.VidsFile(vids, self.c), 0, "video", "mp4", iter([b"junk" * 100]), True,
+                     len(orig))
+        with open(vids, "rb") as f:
+            self.assertEqual(f.read(), orig)
+        self.assertEqual(len(os.listdir(self.d)), 2)
+
     def test_cancel_leaves_file_intact(self):
         import threading
         from jpgs import transcode as T
