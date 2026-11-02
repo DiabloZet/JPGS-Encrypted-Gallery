@@ -316,6 +316,26 @@ class TranscodeTests(unittest.TestCase):
             self.assertEqual(info.height, 120)
             self.assertAlmostEqual(info.duration, 2.0, delta=0.3)
 
+    def test_duration_of_webm_without_index(self):
+        """WebM, записанный «потоком» (браузер, OBS): длительности в заголовке нет."""
+        import importlib.util
+        import subprocess
+        if importlib.util.find_spec("av") is None:
+            self.skipTest("нет PyAV")
+        live = os.path.join(self.d, "live.webm")
+        with open(live, "wb") as f:
+            subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+                            "testsrc2=size=160x120:rate=25", "-t", "6", "-c:v", "libvpx",
+                            "-f", "webm", "-live", "1", "-"], check=True, stdout=f)
+        import av
+        with av.open(live) as ct:
+            self.assertIsNone(ct.duration)  # то самое: длительность неизвестна
+        from jpgs.video import grab_frame, video_duration
+        vids = C.encrypt_stream(live, self.d, self.c)
+        *_rest, info = grab_frame(vids, self.c, 64)
+        self.assertAlmostEqual(info.duration, 6.0, delta=0.2)
+        self.assertAlmostEqual(video_duration(vids, self.c), 6.0, delta=0.2)
+
     def test_cancel_leaves_file_intact(self):
         import threading
         from jpgs import transcode as T
