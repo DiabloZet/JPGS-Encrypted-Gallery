@@ -242,6 +242,90 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(f.read(), vid)
         self.assertTrue(os.path.exists(self.p("dec/mix_1.txt")))
 
+    def test_ai_stored_and_kept_through_operations(self):
+        ai0 = {"v": 1, "m": {"wd": 1}, "t": [["1girl", 90]], "r": "general", "e": "AAAA"}
+        imgs = [fake_jpeg(b"a"), fake_jpeg(b"b"), fake_jpeg(b"c")]
+        p = self.legacy_jpgs("a.jpgs", imgs)
+        with open(p, "rb") as f:
+            before = f.read()
+        offsets = [(e.start, e.length) for e in C.JpgsFile(p, self.c).entries()]
+        C.set_ai(p, {0: ai0, 2: {"v": 1, "m": {}}}, self.c)
+        with open(p, "rb") as f:
+            self.assertTrue(f.read().startswith(before))  # только дописано
+        jf = C.JpgsFile(p, self.c)
+        self.assertEqual([(e.start, e.length) for e in jf.entries()], offsets)  # смещения те же
+        self.assertEqual(jf.entry(0).ai, ai0)
+        self.assertIsNone(jf.entry(1).ai)
+        # заметка, перестановка, дописывание, смена ключа — теги на месте
+        C.set_note(p, 1, "n", self.c)
+        self.assertEqual(C.JpgsFile(p, self.c).entry(0).ai, ai0)
+        C.rewrite_entries(p, [2, 0, 1], self.c)
+        self.assertEqual(C.JpgsFile(p, self.c).entry(1).ai, ai0)
+        C.append_frames(p, [self.write("d.jpg", fake_jpeg(b"d"))], self.c)
+        self.assertEqual(C.JpgsFile(p, self.c).entry(1).ai, ai0)
+        C.reencrypt_media(p, self.c, self.c2)
+        jf = C.JpgsFile(p, self.c2)
+        self.assertEqual(jf.entry(1).ai, ai0)
+        out = C.extract_frames(p, [1], self.c2)
+        self.assertEqual(C.JpgsFile(out[0], self.c2).entry(0).ai, ai0)
+        merged = C.merge_media([p], self.p("m.jpgs"), self.c2)
+        self.assertEqual(C.JpgsFile(merged, self.c2).entry(1).ai, ai0)
+
+    def test_set_ai_refuses_stale_key_and_moved_entries(self):
+        p = self.legacy_jpgs("k.jpgs", [fake_jpeg(b"a"), fake_jpeg(b"b")])
+        with open(p, "rb") as f:
+            raw = f.read()
+        es = C.JpgsFile(p, self.c).entries()
+        C.reencrypt_media(p, self.c, self.c2)  # «пользователь сменил ключ во время анализа»
+        with open(p, "rb") as f:
+            rekeyed = f.read()
+        with self.assertRaises(C.WrongKey):
+            C.set_ai(p, {0: {"v": 1}}, self.c)
+        with open(p, "rb") as f:
+            self.assertEqual(f.read(), rekeyed)  # файл не тронут
+        self.assertNotEqual(raw, rekeyed)
+        # записи переставили — теги, посчитанные для старого порядка, не пишутся
+        C.rewrite_entries(p, [1, 0], self.c2)
+        n = C.set_ai(p, {0: {"v": 1}}, self.c2, {0: (es[0].start, es[0].length + 1)})
+        self.assertEqual(n, 0)
+
+    def test_ai_dropped_when_entry_replaced(self):
+        p = C.build_archive([self.write("a.jpg", fake_jpeg(b"a")), self.write("b.jpg", fake_jpeg(b"b"))],
+                            self.p("x.jpgs"), self.c)
+        C.set_ai(p, {0: {"v": 1}, 1: {"v": 1}}, self.c)
+        other = C.build_archive([self.write("c.jpg", fake_jpeg(b"c"))], self.p("y.jpgs"), self.c)
+        C.rewrite_entries(p, [0, 1], self.c, replace={1: (other, self.c, 0)})
+        jf = C.JpgsFile(p, self.c)
+        self.assertEqual(jf.entry(0).ai, {"v": 1})
+        self.assertIsNone(jf.entry(1).ai)
+
+    def test_bad_ai_field_does_not_break_file(self):
+        e = C.Entry.from_json({"k": "i", "s": 0, "n": 10, "x": "jpg", "ai": "мусор"}, 100)
+        self.assertIsNone(e.ai)
+        e = C.Entry.from_json({"k": "i", "s": 0, "n": 10, "x": "jpg", "ai": {"e": "x" * 20000}}, 100)
+        self.assertIsNone(e.ai)
+        with self.assertRaises(C.ArchiveError):
+            C.set_ai(self.legacy_jpgs("z.jpgs", [fake_jpeg(b"z")]), {0: {"e": "x" * 20000}}, self.c)
+
+    def test_torn_index_append_is_recovered(self):
+        """Дописывание индекса оборвалось (сбой): находим прежний целый индекс и чиним файл."""
+        v = self.write("v.mp4", fake_video(30000))
+        p = C.build_archive([self.write("a.jpg", fake_jpeg(b"a")), v], self.p("x.jpgs"), self.c)
+        C.set_note(p, 1, "видео", self.c)
+        good = os.path.getsize(p)
+        es = [e.copy() for e in C.JpgsFile(p, self.c).entries()]
+        es[0].ai = {"v": 1}
+        blob = C._index_blob(es, self.c, good)
+        with open(p, "ab") as f:
+            f.write(blob[:len(blob) // 2])  # «сбой» посреди записи
+        jf = C.JpgsFile(p, self.c)
+        self.assertEqual([e.kind for e in jf.entries()], ["image", "video"])
+        self.assertEqual(jf.note(1), "видео")
+        self.assertEqual(os.path.getsize(p), good)  # оборванный кусок отрезан
+        # у старых файлов (правильный паддинг в конце) поиск не запускается вовсе
+        legacy = self.legacy_jpgs("l.jpgs", [fake_jpeg(b"l")])
+        self.assertTrue(C.tail_padding_ok(legacy, self.c))
+
     def test_tampered_index_detected(self):
         out = C.build_archive([self.write("v.mp4", fake_video(5000))], self.p("t.jpgs"), self.c)
         with open(out, "r+b") as f:

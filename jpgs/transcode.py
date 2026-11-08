@@ -617,7 +617,8 @@ def _store(jf: C.JpgsFile, ii: int, kind: str, ext: str, chunks, replace: bool,
             mode = C._file_mode(jf.path)
             if mode is not None:
                 os.chmod(tmp, mode)
-            os.replace(tmp, jf.path)
+            with C.WRITE_LOCK:  # не посреди дописывания индекса фоновой ИИ-индексацией
+                os.replace(tmp, jf.path)
             return Result(jf.path, 0, before, after, replaced=True)
         n = jf.count()
         C.rewrite_entries(jf.path, list(range(n)), jf.cipher,

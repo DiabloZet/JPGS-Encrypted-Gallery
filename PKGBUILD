@@ -1,6 +1,6 @@
 # Локальная сборка: в этой папке выполнить  makepkg -si
 pkgname=jpgs
-pkgver=2.5.1
+pkgver=2.6.0
 pkgrel=1
 pkgdesc="Просмотр зашифрованных изображений .jpgs и видео .vids (GTK4, Wayland, libmpv/FFmpeg)"
 arch=('any')
@@ -10,7 +10,9 @@ install=jpgs.install
 optdepends=('python-cryptography: чуть более быстрая расшифровка (иначе используется OpenSSL напрямую)'
             'webp-pixbuf-loader: шифрование .webp'
             'python-nautilus: пункты в меню Nautilus'
-            'ffmpeg: сжатие и конвертация картинок и видео')
+            'ffmpeg: сжатие и конвертация картинок и видео'
+            'python-onnxruntime: поиск по смыслу (локальный ИИ)'
+            'python-numpy: поиск по смыслу (локальный ИИ)')
 
 package() {
     local src="$startdir"

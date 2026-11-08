@@ -26,7 +26,8 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("Gsk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Graphene", "1.0")
-from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk  # noqa: E402
+gi.require_version("Pango", "1.0")
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk, Pango  # noqa: E402
 
 from . import APP_ID, __version__  # noqa: E402
 from . import container as C  # noqa: E402
@@ -35,6 +36,7 @@ from .crypto import Cipher, KeyMissing, KeyRing  # noqa: E402
 from .imaging import DecodeError, decode  # noqa: E402
 from .memory import trim as trim_memory  # noqa: E402
 from .video_ui import VideoPane, fmt_time  # noqa: E402
+from .ai_index import Indexer  # noqa: E402
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
 BYTES_CACHE_LIMIT = 64 * 1024 * 1024
@@ -69,7 +71,8 @@ CSS = b"""
 class Settings:
     DEFAULTS = {"upscale_small": True, "filmstrip": True, "slideshow_seconds": 4,
                 "volume": 100, "mute": False, "loop_video": False, "video_simple": False,
-                "strip_mode": "files", "show_notes": True, "unlock_minutes": 0}
+                "strip_mode": "files", "show_notes": True, "unlock_minutes": 0,
+                "ai_enabled": True, "ai_threads": 2}
 
     def __init__(self):
         self.path = os.path.join(GLib.get_user_config_dir(), "jpgs", "settings.json")
@@ -418,6 +421,14 @@ class JpgsWindow(Adw.ApplicationWindow):
         self.thumb_pending: set[int] = set()        # в очереди или загружается сейчас
         self.thumb_window = (0, -1)                 # [от, до] — что держим загруженным
         self._thumb_refresh_src = 0
+        self._results: Optional[list[tuple[int, int]]] = None  # результаты поиска (файл, запись)
+        self._search_gen = 0
+        self._ai_state = (0, 0, False)           # проиндексировано, всего, идёт ли
+        self._ai_downloads: dict = {}
+        self._ai_dl_progress: dict = {}
+        self.indexer = Indexer(int(self.app.settings.get("ai_threads") or 2),
+                               lambda d, t, r: GLib.idle_add(self._ai_progress, d, t, r),
+                               lambda p: GLib.idle_add(self._ai_file_updated, p))
         self._needs_fix: set[tuple] = set()      # (путь, запись) WebM/MKV без индекса
         self._fix_offered: set[tuple] = set()    # кому уже предлагали исправить
         self.thumb_lock = threading.Lock()
@@ -461,6 +472,9 @@ class JpgsWindow(Adw.ApplicationWindow):
             nav.append(Gtk.Button(icon_name=icon, action_name=act, tooltip_text=tip,
                                   focus_on_click=False))
         hb.pack_start(nav)
+        self.search_btn = Gtk.ToggleButton(icon_name="system-search-symbolic", focus_on_click=False,
+                                           tooltip_text="Поиск по смыслу (Ctrl+F)")
+        hb.pack_start(self.search_btn)
 
         menu = Gio.Menu()
         s1 = Gio.Menu()
@@ -485,6 +499,7 @@ class JpgsWindow(Adw.ApplicationWindow):
         menu.append_section(None, s3)
         s4 = Gio.Menu()
         s4.append("Ключи шифрования…", "app.key")
+        s4.append("Поиск по смыслу (ИИ)…", "win.ai-settings")
         s4.append("Заблокировать (забыть пароль)", "app.lock")
         s4.append("Горячие клавиши", "win.shortcuts")
         s4.append("О программе", "app.about")
@@ -577,6 +592,22 @@ class JpgsWindow(Adw.ApplicationWindow):
         # открывал системное меню окна (свернуть/переместить/закрыть) вместо меню JPGS.
         self.overlay.set_vexpand(True)
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.search_entry = Gtk.SearchEntry(
+            hexpand=True, search_delay=400,
+            placeholder_text="Поиск по смыслу: «кошка на диване», «пляж», «девушка в купальнике»…")
+        self.search_status = Gtk.Label(css_classes=["caption", "dim-label"], xalign=0,
+                                       ellipsize=Pango.EllipsizeMode.END, max_width_chars=48)
+        sbox = Gtk.Box(spacing=12, margin_start=12, margin_end=12)
+        sbox.append(self.search_entry)
+        sbox.append(self.search_status)
+        self.search_bar = Gtk.SearchBar(child=sbox, show_close_button=True)
+        self.search_bar.connect_entry(self.search_entry)
+        self.search_bar.bind_property("search-mode-enabled", self.search_btn, "active",
+                                      GObject.BindingFlags.BIDIRECTIONAL)
+        self.search_bar.connect("notify::search-mode-enabled", self._search_mode_changed)
+        self.search_entry.connect("search-changed", self._on_search_changed)
+        self.search_entry.connect("activate", self._on_search_changed)
+        content.append(self.search_bar)
         content.append(self.overlay)
         self.tv.set_content(content)
 
@@ -674,6 +705,9 @@ class JpgsWindow(Adw.ApplicationWindow):
         add("rekey-file", self.rekey_current)
         add("rekey-folder", self.rekey_folder)
         add("note-edit", self.note_edit)
+        add("search", self.toggle_search)
+        add("find-similar", self.find_similar)
+        add("ai-settings", self.ai_settings)
         add("transcode", self.transcode_dialog)
         sn = Gio.SimpleAction.new_stateful("notes-show", None,
                                            GLib.Variant("b", bool(self.app.settings.get("show_notes"))))
@@ -804,6 +838,7 @@ class JpgsWindow(Adw.ApplicationWindow):
             self._enable(a, has)
         self._enable("rekey-file", has)
         self._enable("note-edit", has)
+        self._enable("find-similar", has and self._cur_ai_vec() is not None)
         self._enable("transcode", has and (shown or is_video))
         self._enable("rekey-folder", has)
         self._enable("video-frame", is_video)
@@ -829,6 +864,8 @@ class JpgsWindow(Adw.ApplicationWindow):
 
     def _update_strip_visibility(self):
         many = len(self.files) > 1 or (self.files and (self.counts.get(self.fi) or 0) > 1)
+        if self._results is not None:
+            many = bool(self._results)  # результаты поиска видны всегда, даже один
         on = bool(self.app.settings.get("filmstrip") and many and not self.is_fullscreen())
         if on and not self.strip_revealer.get_reveal_child():
             self.strip_revealer.set_reveal_child(True)
@@ -843,6 +880,8 @@ class JpgsWindow(Adw.ApplicationWindow):
     def _set_strip_mode(self, mode: str):
         if mode not in ("files", "frames"):
             return
+        if self._results is not None:
+            self.search_bar.set_search_mode(False)  # выйти из результатов поиска
         self.lookup_action("strip-mode").set_state(GLib.Variant("s", mode))
         if mode == self.app.settings.get("strip_mode"):
             return
@@ -863,6 +902,15 @@ class JpgsWindow(Adw.ApplicationWindow):
         self.store.remove_all()
         if not self.files:
             self.strip_fi = None
+            return
+        if self._results is not None:
+            self.strip_fi = None
+            items = []
+            for k, (fi, ii) in enumerate(self._results):
+                it = FileItem(k, self.files[fi], self.strip_gen, ii)
+                it.fi, it.result = fi, True
+                items.append(it)
+            self.store.splice(0, 0, items)
             return
         if not self._frames_mode():
             self.strip_fi = None
@@ -924,9 +972,13 @@ class JpgsWindow(Adw.ApplicationWindow):
             self.bytes_cache.clear()
             self.bytes_total = 0
         self.fi = start
+        if self._results is not None:
+            self._results = None  # результаты были про прежний список файлов
+            self.search_bar.set_search_mode(False)
         self._rebuild_strip()
         self._update_strip_visibility()
         self.show(start, 0)
+        self._start_indexer()
 
     def choose_open(self):
         dlg = Gtk.FileDialog(title="Открыть зашифрованный файл")
@@ -1023,7 +1075,9 @@ class JpgsWindow(Adw.ApplicationWindow):
         with self.bytes_lock:
             for k in [k for k in self.bytes_cache if k[0] == jf.path]:
                 self.bytes_total -= len(self.bytes_cache.pop(k))
-        if self._frames_mode():
+        if self._results is not None:
+            GLib.idle_add(lambda: self._on_search_changed(self.search_entry) and False)
+        elif self._frames_mode():
             if self.strip_fi == fi:
                 self._rebuild_strip()  # кадры переставлены/удалены — лента заполнится заново
         else:
@@ -1307,6 +1361,10 @@ class JpgsWindow(Adw.ApplicationWindow):
                                  f" {e.ext}, {human_size(e.length)}")
                 if e.note:
                     lines.append(f"Заметка: {e.note}")
+                if e.ai:
+                    from . import ai as A
+                    tags = A.labels_ru(e.ai)
+                    lines.append("Теги ИИ: " + (", ".join(tags[:25]) if tags else "—"))
             except (IndexError, OSError, C.ArchiveError):
                 pass
         d = Adw.AlertDialog(heading=jf.name, body="\n".join(lines))
@@ -1549,6 +1607,196 @@ class JpgsWindow(Adw.ApplicationWindow):
                 self._reload_folder(jf.path, ii)
         threading.Thread(target=job_thread, daemon=True).start()
 
+    # ---------------------------------------------------------------- ИИ: индексация и поиск
+
+    def ai_settings(self):
+        from .ai_ui import AISettings
+        AISettings(self).present()
+
+    def _ai_engine(self):
+        """Один движок на окно: его же использует индексатор (сессии ONNX не дублируются)."""
+        from . import ai as A
+        eng = self.indexer.engine
+        threads = int(self.app.settings.get("ai_threads") or 2)
+        if eng is None or eng.threads != threads:
+            eng = A.Engine(threads)
+            self.indexer.engine = eng
+        return eng
+
+    def _ai_engine_reset(self):
+        self.indexer.stop(wait=5)
+        self.indexer.engine = None
+
+    def _start_indexer(self):
+        from . import ai as A
+        if not self.files or not self.app.settings.get("ai_enabled") or A.missing_libs() \
+                or not A.installed_models():
+            return
+        self.indexer.threads = int(self.app.settings.get("ai_threads") or 2)
+        self._ai_engine()
+        kr = self.app.keyring
+        self.indexer.start([(f.path, f.cipher) for f in self.files
+                            if f.cipher is not None and (kr is None or kr.cipher_for(f.path))])
+
+    def _ai_progress(self, done, total, running):
+        self._ai_state = (done, total, running)
+        tip = "Поиск по смыслу (Ctrl+F)"
+        if total:
+            tip += f"\nПроиндексировано {done} из {total}" + (" · индексация идёт" if running else "")
+        self.search_btn.set_tooltip_text(tip)
+        if self.search_bar.get_search_mode() and self._results is None:
+            self._search_idle_status()
+        return False
+
+    def _ai_file_updated(self, path):
+        """Индексатор дописал теги в файл: перечитать индекс (смещения данных не менялись)."""
+        for f in self.files:
+            if f.path == path:
+                f.invalidate()
+        return False
+
+    def _search_idle_status(self):
+        from . import ai as A
+        d, t, running = self._ai_state
+        if A.missing_libs():
+            text = "Нужны библиотеки ИИ — см. «Поиск по смыслу (ИИ)…» в меню"
+        elif not A.installed_models():
+            text = "Скачайте модели: меню → «Поиск по смыслу (ИИ)…»"
+        elif t:
+            text = f"Проиндексировано {d} из {t}" + (" · идёт индексация" if running else "")
+        else:
+            text = ""
+        self.search_status.set_text(text)
+
+    def toggle_search(self):
+        on = not self.search_bar.get_search_mode()
+        self.search_bar.set_search_mode(on)
+        if on:
+            self.search_entry.grab_focus()
+
+    def _search_mode_changed(self, bar, _p):
+        if bar.get_search_mode():
+            self._search_idle_status()
+            GLib.idle_add(lambda: self.search_entry.grab_focus() and False)
+            from . import ai as A
+            if not A.installed_models() and not A.missing_libs():
+                t = Adw.Toast(title="Для поиска нужны модели ИИ (скачиваются один раз)",
+                              button_label="Настроить", timeout=8)
+                t.connect("button-clicked", lambda *_: self.ai_settings())
+                self.toasts.add_toast(t)
+        else:
+            self._search_gen += 1
+            if self._results is not None:
+                self._set_results(None)
+
+    def _ai_items(self, files):
+        """[((файл, запись), ai)] по всем проиндексированным записям папки + сколько всего."""
+        items, total = [], 0
+        for fi, jf in enumerate(files):
+            try:
+                es = jf.entries()
+            except Exception:  # noqa: BLE001
+                continue
+            total += len(es)
+            items += [((fi, ii), e.ai) for ii, e in enumerate(es) if e.ai]
+        return items, total
+
+    def _on_search_changed(self, entry):
+        text = entry.get_text().strip()
+        if not text:
+            self._search_gen += 1
+            if self._results is not None:
+                self._set_results(None)
+            self._search_idle_status()
+            return
+        self._run_search(text=text)
+
+    def _run_search(self, text: str = "", vec=None, exclude=None):
+        from . import ai as A
+        if A.missing_libs():
+            self._search_idle_status()
+            return
+        self._search_gen += 1
+        gen, files = self._search_gen, list(self.files)
+        self.search_status.set_text("Поиск…")
+
+        def job():
+            try:
+                items, total = self._ai_items(files)
+                exact = True
+                if vec is not None:
+                    res = A.similar(items, vec, exclude)
+                else:
+                    qvec = None
+                    eng = self._ai_engine()
+                    if eng.can_search():
+                        qvec = eng.embed_text(text)
+                    res, exact = A.rank(text, items, qvec)
+                out = ([k for k, _s in res], exact, len(items), total, None)
+            except Exception as e:  # noqa: BLE001
+                traceback.print_exc()
+                out = (None, True, 0, 0, e)
+            GLib.idle_add(lambda: done(*out) and False)
+
+        def done(res, exact, indexed, total, err):
+            if gen != self._search_gen or files != self.files:
+                return  # запрос устарел или открыта другая папка
+            if err is not None:
+                self.search_status.set_text(f"Ошибка поиска: {err}")
+                return
+            if not indexed:
+                self.search_status.set_text("Пока ничего не проиндексировано" if total else "")
+                self._set_results([])
+                return
+            part = "" if indexed >= total else f" · проиндексировано {indexed} из {total}"
+            if not res:
+                self.search_status.set_text("Ничего не найдено" + part)
+            elif vec is not None:
+                self.search_status.set_text(f"Похожие: {len(res)}" + part)
+            elif exact:
+                self.search_status.set_text(f"Найдено: {len(res)}" + part)
+            else:
+                self.search_status.set_text("Точных совпадений нет — самые похожие" + part)
+            self._set_results(res)
+        threading.Thread(target=job, daemon=True).start()
+
+    def _set_results(self, res):
+        self._results = None if res is None else list(res)
+        self._rebuild_strip()
+        self._update_strip_visibility()
+        if self._results:
+            self.show(*self._results[0])
+        else:
+            self._sync_strip()
+
+    def _cur_ai_vec(self):
+        """Вектор смысла текущей записи (для «Найти похожие») или None."""
+        if not self.files:
+            return None
+        jf = self.files[self.fi]
+        try:
+            if not (jf.indexed or jf.is_video or C.has_index(jf.path)):
+                return None
+            ai = jf.entry(max(0, self._resolve(self.fi, self.ii))).ai
+        except (OSError, IndexError, C.ArchiveError):
+            return None
+        if not ai or not ai.get("e"):
+            return None
+        from . import ai as A
+        try:
+            return A.unpack_vec(ai["e"])
+        except Exception:  # noqa: BLE001
+            return None
+
+    def find_similar(self):
+        vec = self._cur_ai_vec()
+        if vec is None:
+            self.toast("Эта картинка ещё не проиндексирована")
+            return
+        cur = (self.fi, max(0, self._resolve(self.fi, self.ii)))
+        self.search_bar.set_search_mode(True)
+        self._run_search(vec=vec, exclude=cur)
+
     # ---------------------------------------------------------------- заметки
 
     def _current_note(self) -> str:
@@ -1730,6 +1978,8 @@ class JpgsWindow(Adw.ApplicationWindow):
             menu.append_section("Видео", s)
             s2 = Gio.Menu()
             s2.append("Заметка…", "win.note-edit")
+            if self._cur_ai_vec() is not None:
+                s2.append("Найти похожие", "win.find-similar")
             s2.append("Сжать / конвертировать…", "win.transcode")
             if self._cur_needs_fix():
                 s2.append("Исправить перемотку (без потери качества)", "win.video-fix-index")
@@ -1739,6 +1989,8 @@ class JpgsWindow(Adw.ApplicationWindow):
         else:
             s = Gio.Menu()
             s.append("Заметка…", "win.note-edit")
+            if self._cur_ai_vec() is not None:
+                s.append("Найти похожие", "win.find-similar")
             s.append("Копировать изображение", "win.copy")
             s.append("Сохранить расшифрованную копию…", "win.save-as")
             s.append("Сжать / конвертировать…", "win.transcode")
@@ -2279,6 +2531,11 @@ class JpgsWindow(Adw.ApplicationWindow):
 
     def _strip_pos(self) -> int:
         """Какой элемент ленты соответствует текущему изображению."""
+        if self._results is not None:
+            try:
+                return self._results.index((self.fi, self._resolve(self.fi, self.ii)))
+            except ValueError:
+                return Gtk.INVALID_LIST_POSITION
         if not self._frames_mode():
             return self.fi
         ii = self._resolve(self.fi, self.ii)
@@ -2288,7 +2545,7 @@ class JpgsWindow(Adw.ApplicationWindow):
     def _frame_badge(item, extra: str) -> str:
         """Подпись миниатюры: номер кадра (в режиме «кадры»), ▶ длительность, ✎ — есть заметка."""
         parts = []
-        if item.ii is not None:
+        if item.ii is not None and not getattr(item, "result", False):
             parts.append(str(item.ii + 1))
         if extra:
             parts.append(extra)
@@ -2302,7 +2559,7 @@ class JpgsWindow(Adw.ApplicationWindow):
     def _sync_strip(self):
         if not self.files:
             return
-        if self._frames_mode() and self.strip_fi != self.fi:
+        if self._results is None and self._frames_mode() and self.strip_fi != self.fi:
             self._rebuild_strip()  # перешли в другой файл — показываем его кадры
         self._update_strip_visibility()
         self._syncing = True
@@ -2330,7 +2587,10 @@ class JpgsWindow(Adw.ApplicationWindow):
         pos = sel.get_selected()
         if pos == Gtk.INVALID_LIST_POSITION or pos == self._strip_pos():
             return
-        if self._frames_mode():
+        if self._results is not None:
+            if pos < len(self._results):
+                self.show(*self._results[pos])
+        elif self._frames_mode():
             if self.strip_fi is not None and self.strip_fi < len(self.files):
                 self.show(self.strip_fi, pos)
         else:
@@ -2506,6 +2766,9 @@ class JpgsWindow(Adw.ApplicationWindow):
 
     def close_files(self):
         """Закрыть все файлы и очистить кэши расшифрованного (после блокировки)."""
+        self.indexer.stop()
+        self._results = None
+        self.search_bar.set_search_mode(False)
         self._stop_slideshow()
         self.video.stop()
         self.files = []
@@ -2791,6 +3054,7 @@ class JpgsWindow(Adw.ApplicationWindow):
                 "F5 — слайд-шоу; T — лента миниатюр; Shift+T — лента: файлы ↔ кадры\n"
                 "Ctrl+S — сохранить; Ctrl+C — копировать; Delete — в корзину\n"
                 "N — заметка; Shift+N — показывать заметки; Ctrl+L — заблокировать\n"
+                "Ctrl+F — поиск по смыслу; Ctrl+Shift+F — найти похожие\n"
                 "Ctrl+O — открыть; Ctrl+W — закрыть\n\n"
                 "Видео: Пробел или клик — пауза; двойной клик — полный экран;\n"
                 "Ctrl+← → — перемотка ±10 с; ↑ ↓ или колёсико — громкость; M — звук")
@@ -2806,6 +3070,9 @@ class JpgsWindow(Adw.ApplicationWindow):
         return False
 
     def _on_close(self, *_):
+        # индексация живёт только вместе с окном; дождаться, пока допишет текущий файл,
+        # чтобы выход не оборвал запись индекса на середине
+        self.indexer.stop(wait=15)
         self._stop_slideshow()
         self.ctx_popover.unparent()
         self.strip_popover.unparent()
@@ -2893,6 +3160,8 @@ class JpgsApp(Adw.Application):
             "win.slideshow": ["F5"],
             "win.filmstrip": ["t"],
             "win.note-edit": ["n"],
+            "win.search": ["<Control>f"],
+            "win.find-similar": ["<Control><Shift>f"],
             "win.notes-show": ["<Shift>n"],
             "app.lock": ["<Control>l"],
             "win.strip-mode-cycle": ["<Shift>t"],

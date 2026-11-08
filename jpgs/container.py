@@ -59,6 +59,22 @@ class ArchiveError(Exception):
     pass
 
 
+# Все изменения файлов внутри программы идут по очереди: фоновая ИИ-индексация дописывает
+# индекс, а пользователь в это время может переставлять кадры или дописывать видео —
+# одновременная запись в один файл перемешала бы данные.
+WRITE_LOCK = threading.RLock()
+
+
+def _writes(fn):
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        with WRITE_LOCK:
+            return fn(*a, **k)
+    return wrapper
+
+
 class WrongKey(ArchiveError):
     """У файла есть индекс, но он не сходится с этим ключом."""
 
@@ -247,6 +263,7 @@ _HEAD = struct.Struct("<8sHHIQQ")  # 32 байта, затем HMAC (32)
 INDEX_FORMAT = 1
 MAX_INDEX_BYTES = 64 << 20
 NOTE_MAX = 64 * 1024
+AI_MAX = 16 * 1024  # байт JSON на запись: вектор (~1 КБ) + теги
 _EXT_RE = re.compile(r"^[a-z0-9]{0,8}$")
 
 
@@ -257,16 +274,23 @@ class Entry:
     length: int         # длина без паддинга
     ext: str = ""       # jpg, png, mp4, webm, gif…
     note: str = ""
+    ai: Optional[dict] = None  # теги и вектор смысла (jpgs.ai), зашифрованы вместе с индексом
 
     @property
     def is_video(self) -> bool:
         return self.kind == "video"
+
+    def copy(self) -> "Entry":
+        return Entry(self.kind, self.start, self.length, self.ext, self.note,
+                     dict(self.ai) if self.ai else None)
 
     def to_json(self) -> dict:
         d = {"k": "v" if self.is_video else "i", "s": self.start, "n": self.length,
              "x": self.ext}
         if self.note:
             d["note"] = self.note
+        if self.ai:
+            d["ai"] = self.ai
         return d
 
     @classmethod
@@ -280,7 +304,11 @@ class Entry:
                 or s + n > limit or not isinstance(ext, str) or not _EXT_RE.match(ext)
                 or not isinstance(note, str) or len(note) > NOTE_MAX):
             raise ArchiveError("повреждённый индекс")
-        return cls(kind, s, n, ext, note)
+        ai = d.get("ai")
+        if ai is not None and (not isinstance(ai, dict) or
+                               len(json.dumps(ai, ensure_ascii=False)) > AI_MAX):
+            ai = None  # непонятные данные ИИ не мешают открыть файл: просто переиндексируем
+        return cls(kind, s, n, ext, note, ai)
 
 
 def _read_trailer(f) -> Optional[tuple[int, int, bytes, bytes]]:
@@ -335,6 +363,68 @@ def load_index(path: str, cipher: Cipher) -> Optional[list[Entry]]:
     except (ValueError, KeyError, TypeError, UnicodeDecodeError):
         raise ArchiveError("повреждённый индекс архива") from None
     return [Entry.from_json(d, off) for d in items]
+
+
+def tail_padding_ok(path: str, cipher: Cipher) -> bool:
+    """Последний блок расшифровывается в правильный паддинг PKCS#7 (конец старого формата)."""
+    try:
+        with open(path, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            if size < BLOCK or size % BLOCK:
+                return False
+            f.seek(size - BLOCK)
+            last = cipher.decrypt_blocks(f.read(BLOCK))
+    except OSError:
+        return False
+    p = last[-1]
+    return 1 <= p <= BLOCK and last.endswith(bytes([p]) * p)
+
+
+RECOVER_SCAN = 64 << 20
+
+
+def recover_index(path: str, cipher: Cipher, repair: bool = True) -> Optional[list[Entry]]:
+    """Найти последний целый индекс, если дописывание нового оборвалось на середине.
+
+    Ищем назад от конца хвост "JPGSIDX2" на границе блока, у которого сходятся смещения
+    и HMAC (то есть это наш индекс этим ключом). repair — отрезать оборванный кусок.
+    """
+    try:
+        size = os.path.getsize(path)
+        start = max(0, size - RECOVER_SCAN)
+        with open(path, "rb") as f:
+            f.seek(start)
+            data = f.read()
+            pos = len(data)
+            while True:
+                pos = data.rfind(TRAILER_MAGIC, 0, pos)
+                if pos < 0:
+                    return None
+                at = start + pos
+                if at % BLOCK == 0 and pos + TRAILER_SIZE <= len(data):
+                    head, mac = data[pos:pos + 32], data[pos + 32:pos + TRAILER_SIZE]
+                    _m, ver, _fl, _r, off, ln = _HEAD.unpack(head)
+                    if (ver == INDEX_FORMAT and off % BLOCK == 0 and off + ln == at
+                            and 32 <= ln <= MAX_INDEX_BYTES):
+                        f.seek(off)
+                        region = f.read(ln)
+                        if len(region) == ln and hmac.compare_digest(mac, _mac(cipher, head, region)):
+                            plain = cbc_decrypt(cipher.subkey(b"index-enc"), region[:16], region[16:])
+                            items = json.loads(plain.decode("utf-8"))["entries"]
+                            entries = [Entry.from_json(d, off) for d in items]
+                            end = at + TRAILER_SIZE
+                            break
+                pos -= 1
+    except (OSError, ValueError, KeyError, TypeError, ArchiveError):
+        return None
+    if repair and end < size:
+        with WRITE_LOCK:
+            try:
+                if os.path.getsize(path) == size:  # никто не успел дописать
+                    os.truncate(path, end)
+            except OSError:
+                pass
+    return entries
 
 
 def _index_blob(entries: list[Entry], cipher: Cipher, at: int) -> bytes:
@@ -401,6 +491,10 @@ class JpgsFile:
                     idx = load_index(self.path, self.cipher)
                 except WrongKey:
                     idx = []  # чужой ключ: показывать нечего
+                if idx is None and not tail_padding_ok(self.path, self.cipher):
+                    # конец файла не похож ни на индекс, ни на конец старого формата —
+                    # возможно, дописывание индекса оборвалось (сбой, питание)
+                    idx = recover_index(self.path, self.cipher)
                 if idx is not None:
                     self._v2 = True
                     self._entries = idx
@@ -866,7 +960,7 @@ def _cipher_for(path: str, keys: Keys) -> Optional[Cipher]:
 
 def _legacy_ok(entries: list[Entry], vids: bool) -> bool:
     """Можно ли записать без индекса (в формате, понятном прежним версиям)."""
-    if any(e.note for e in entries):
+    if any(e.note or e.ai for e in entries):
         return False
     if vids:
         return len(entries) == 1 and entries[0].is_video
@@ -896,18 +990,19 @@ class ArchiveWriter:
         self.entries: list[Entry] = []
         self.mode = mode
 
-    def add_bytes(self, kind: str, data: bytes, ext: str, note: str = ""):
+    def add_bytes(self, kind: str, data: bytes, ext: str, note: str = "",
+                  ai: Optional[dict] = None):
         enc = self.cipher.encrypt(data)
         self.f.write(enc)
-        self.entries.append(Entry(kind, self.pos, len(data), ext, note))
+        self.entries.append(Entry(kind, self.pos, len(data), ext, note, ai))
         self.pos += len(enc)
 
     def add_stream(self, kind: str, chunks: Iterable[bytes], ext: str, note: str = "",
-                   total: int = 0, progress: Progress = None):
+                   total: int = 0, progress: Progress = None, ai: Optional[dict] = None):
         start = self.pos
         n = _write_encrypted(self.f, chunks, self.cipher, total, progress)
         self.pos = self.f.tell()
-        self.entries.append(Entry(kind, start, n, ext, note))
+        self.entries.append(Entry(kind, start, n, ext, note, ai))
 
     def finish(self) -> str:
         try:
@@ -957,6 +1052,7 @@ class _Item:
     chunks: Optional[Callable[[], Iterable[bytes]]] = None
     size: int = 0
     raw_copy: Optional[tuple[str, int, int]] = None  # (путь, начало, длина) — тот же ключ, выровнено
+    ai: Optional[dict] = None  # теги/вектор переносятся вместе с записью
 
 
 def _expand_source(src: str, keys: Keys) -> list[_Item]:
@@ -972,7 +1068,7 @@ def _expand_source(src: str, keys: Keys) -> list[_Item]:
             raise ArchiveError(f"{os.path.basename(src)}: в файле нет записей")
         items = []
         for e in es:
-            items.append(_Item(e.kind, e.ext, e.note, size=e.length,
+            items.append(_Item(e.kind, e.ext, e.note, size=e.length, ai=e.ai,
                                chunks=lambda e=e, c=c: _iter_entry(src, c, e)))
         return items
     ext = low.rsplit(".", 1)[-1] if "." in low else ""
@@ -1005,10 +1101,11 @@ def build_archive(sources: list[str], dest: str, cipher: Cipher, keys: Optional[
         for it in items:
             base = done[0]
             if it.data is not None:
-                w.add_bytes(it.kind, it.data, it.ext, it.note)
+                w.add_bytes(it.kind, it.data, it.ext, it.note, it.ai)
                 done[0] += len(it.data)
             else:
-                w.add_stream(it.kind, it.chunks(), it.ext, it.note, it.size,
+                w.add_stream(it.kind, it.chunks(), it.ext, it.note, it.size, ai=it.ai,
+                             progress=
                              (lambda d, t, b=base: progress(b + d, total)) if progress else None)
                 done[0] += it.size
             if progress:
@@ -1062,6 +1159,7 @@ def _file_mode(path: str) -> Optional[int]:
         return None
 
 
+@_writes
 def rewrite_entries(path: str, order: list[int], cipher: Cipher, new_cipher: Optional[Cipher] = None,
                     notes: Optional[dict[int, str]] = None, progress: Progress = None,
                     replace: Optional[dict[int, tuple[str, Cipher, int]]] = None) -> None:
@@ -1095,8 +1193,11 @@ def rewrite_entries(path: str, order: list[int], cipher: Cipher, new_cipher: Opt
         for i in order:
             sp, sc, e = src[i]
             base = done
+            # у заменённой записи (результат конвертации) старые теги уже не про неё
+            ai = None if i in replace else es[i].ai
             w.add_stream(e.kind, _iter_entry(sp, sc, e), e.ext, notes.get(i, es[i].note),
-                         e.length, (lambda d, t, b=base: progress(b + d, total)) if progress else None)
+                         e.length, (lambda d, t, b=base: progress(b + d, total)) if progress else None,
+                         ai=ai)
             done += e.length
         w.finish()
     if progress:
@@ -1125,6 +1226,7 @@ def dead_bytes(path: str, cipher: Cipher) -> int:
 SMALL_FILE = 64 << 20
 
 
+@_writes
 def set_note(path: str, i: int, text: str, cipher: Cipher) -> None:
     """Заметка к записи i (картинке или видео). Пустой текст — удалить заметку.
 
@@ -1135,8 +1237,10 @@ def set_note(path: str, i: int, text: str, cipher: Cipher) -> None:
     text = (text or "").replace("\r\n", "\n").strip()
     if len(text) > NOTE_MAX:
         raise ArchiveError(f"заметка длиннее {NOTE_MAX} символов")
+    if not verify_media(path, cipher):
+        raise WrongKey(f"{os.path.basename(path)}: не расшифровывается этим ключом")
     jf = open_media(path, cipher)
-    es = [Entry(e.kind, e.start, e.length, e.ext, e.note) for e in jf.entries()]
+    es = [e.copy() for e in jf.entries()]
     if not es:
         raise ArchiveError("файл не расшифровывается этим ключом")
     if not 0 <= i < len(es):
@@ -1155,6 +1259,42 @@ def set_note(path: str, i: int, text: str, cipher: Cipher) -> None:
         rewrite_entries(path, list(range(len(es))), cipher)
 
 
+@_writes
+def set_ai(path: str, updates: dict[int, dict], cipher: Cipher,
+           expect: Optional[dict[int, tuple[int, int]]] = None) -> int:
+    """Записать результаты ИИ-анализа {номер записи: ai} в индекс файла.
+
+    Всегда дописыванием в конец: смещения записей не меняются, поэтому открытый в
+    просмотрщике файл продолжает читаться без перезагрузки, а прерванная запись не
+    портит данные. Старый .jpgs/.vids при этом получает индекс (архив v2).
+    """
+    if not updates:
+        return 0
+    if os.path.getsize(path) % BLOCK:
+        raise ArchiveError("файл повреждён (размер не кратен 16 байтам)")
+    if not verify_media(path, cipher):
+        # файл успели перешифровать другим ключом (или подменить): дописать индекс старым
+        # ключом значило бы сломать его для нового
+        raise WrongKey(f"{os.path.basename(path)}: ключ больше не подходит")
+    jf = open_media(path, cipher)
+    es = [e.copy() for e in jf.entries()]
+    if not es:
+        raise WrongKey("файл не расшифровывается этим ключом")
+    n = 0
+    for i, ai in updates.items():
+        if not 0 <= i < len(es):
+            continue
+        if expect and expect.get(i) != (es[i].start, es[i].length):
+            continue  # запись переставили/удалили, пока шёл анализ — эти теги не про неё
+        if len(json.dumps(ai, ensure_ascii=False)) > AI_MAX:
+            raise ArchiveError("слишком большие данные ИИ для одной записи")
+        es[i].ai = ai
+        n += 1
+    if n:
+        _append_index(path, es, cipher)
+    return n
+
+
 def _append_index(path: str, entries: list[Entry], cipher: Cipher):
     size = os.path.getsize(path)
     with open(path, "r+b") as f:
@@ -1168,6 +1308,7 @@ def _append_index(path: str, entries: list[Entry], cipher: Cipher):
             raise
 
 
+@_writes
 def append_frames(target: str, sources: list[str], cipher: Cipher,
                   keys: Optional[Keys] = None, progress: Progress = None) -> int:
     """Дописывает в конец архива target картинки, видео и записи других .jpgs/.vids.
@@ -1186,7 +1327,7 @@ def append_frames(target: str, sources: list[str], cipher: Cipher,
     if not verify_media(target, cipher):
         raise WrongKey(f"{os.path.basename(target)}: не расшифровывается этим ключом")
     jf = JpgsFile(target, cipher)
-    old = [Entry(e.kind, e.start, e.length, e.ext, e.note) for e in jf.entries()]
+    old = [e.copy() for e in jf.entries()]
     if not old:
         raise ArchiveError("файл не расшифровывается этим ключом")
     items: list[_Item] = []
@@ -1196,7 +1337,7 @@ def append_frames(target: str, sources: list[str], cipher: Cipher,
         items.extend(_expand_source(src, keys))
     if not items:
         return 0
-    new_entries = [Entry(it.kind, 0, 0, it.ext, it.note) for it in items]
+    new_entries = [Entry(it.kind, 0, 0, it.ext, it.note, it.ai) for it in items]
     need_index = jf.is_v2 or not _legacy_ok(old + new_entries, False)
     total = sum(it.size or len(it.data or b"") for it in items)
     done = 0
@@ -1218,7 +1359,7 @@ def append_frames(target: str, sources: list[str], cipher: Cipher,
                                          if progress else None)
                 pos = out.tell()
                 done += n
-                entries.append(Entry(it.kind, start, n, it.ext, it.note))
+                entries.append(Entry(it.kind, start, n, it.ext, it.note, it.ai))
             if need_index:
                 out.write(_index_blob(entries, cipher, pos))
             out.flush()
@@ -1240,7 +1381,7 @@ def extract_frames(path: str, indices: list[int], cipher: Cipher) -> list[str]:
         e = es[i]
         dest = os.path.join(folder, f"{uuid.uuid4()}.{'vids' if e.is_video else 'jpgs'}")
         with ArchiveWriter(dest, cipher) as w:
-            w.add_stream(e.kind, _iter_entry(path, cipher, e), e.ext, e.note, e.length)
+            w.add_stream(e.kind, _iter_entry(path, cipher, e), e.ext, e.note, e.length, ai=e.ai)
             w.finish()
         out.append(dest)
     return out
@@ -1295,6 +1436,7 @@ def reencrypt_jpgs(path: str, old: Cipher, new: Cipher) -> None:
     rewrite_entries(path, list(range(len(rs))), old, new)
 
 
+@_writes
 def reencrypt_vids(path: str, old: Cipher, new: Cipher, progress: Progress = None) -> None:
     """Перешифровывает видео .vids со старого ключа на новый, потоково."""
     if has_index(path):
