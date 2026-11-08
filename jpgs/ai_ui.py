@@ -13,8 +13,8 @@ from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from . import ai as A  # noqa: E402
 
-INSTALL_HINT = ("Arch: sudo pacman -S python-onnxruntime python-numpy python-tokenizers\n"
-                "Debian/Ubuntu: pip install --user onnxruntime numpy tokenizers")
+INSTALL_HINT = ("Arch: sudo pacman -S python-onnxruntime-cpu python-numpy\n"
+                "Debian/Ubuntu: pip install --user onnxruntime numpy")
 
 
 def _mb(n: int) -> str:
@@ -48,7 +48,7 @@ class AISettings:
                         ".jpgs — в зашифрованном виде. Индексация идёт в фоне, только пока открыта "
                         "программа, и останавливается вместе с ней.")
         self.page.add(g0)
-        missing = A.missing_libs(("onnxruntime", "numpy", "tokenizers"))
+        missing = A.missing_libs()
         if missing:
             row = Adw.ActionRow(title="Не установлены библиотеки: " + ", ".join(missing),
                                 subtitle=INSTALL_HINT)

@@ -361,15 +361,56 @@ class Engine:
     def embed_text(self, text: str):
         import numpy as np
         if self._tok is None:
-            from tokenizers import Tokenizer
-            self._tok = Tokenizer.from_file(self._path("siglip2", "tokenizer.json"))
-            self._pad = self._tok.token_to_id("<pad>") or 0
-        ids = self._tok.encode(text.lower()).ids[:64]
-        ids = ids + [self._pad] * (64 - len(ids))
+            self._tok = GemmaTokenizer(self._path("siglip2", "tokenizer.json"))
+        ids = self._tok.encode(text.lower(), 64)
         with self._lock:
             s = self._session("siglip_t", self._path("siglip2", "text.onnx"))
             v = s.run(["pooler_output"], {"input_ids": np.array([ids], dtype=np.int64)})[0][0]
         return v / (np.linalg.norm(v) or 1.0)
+
+
+class GemmaTokenizer:
+    """Токенизатор SigLIP2 (Gemma, BPE SentencePiece) на чистом Python — без библиотеки
+    tokenizers (её нет в репозиториях многих дистрибутивов).
+
+    Пробелы → «▁», затем BPE: на каждом шаге сливается соседняя пара, чей результат есть в
+    словаре и имеет наименьший номер (у SentencePiece номер = порядок веса токена, это
+    даёт тот же результат, что и таблица слияний; сверено с tokenizers на сотнях фраз).
+    Символы, которых нет в словаре, кодируются байтами <0xNN>. В конце — <eos>, затем
+    дополнение <pad> до нужной длины.
+    """
+
+    def __init__(self, path: str):
+        import json
+        with open(path, encoding="utf-8") as f:
+            tj = json.load(f)
+        self.vocab: dict[str, int] = tj["model"]["vocab"]
+        self.pad = self.vocab.get("<pad>", 0)
+        self.eos = self.vocab.get("<eos>", 1)
+        self.unk = self.vocab.get("<unk>", 3)
+
+    def encode(self, text: str, length: int = 64) -> list[int]:
+        vocab = self.vocab
+        parts: list[str] = []
+        for ch in text.replace(" ", "▁"):
+            if ch in vocab:
+                parts.append(ch)
+            else:
+                parts += ["<0x%02X>" % b for b in ch.encode("utf-8")]
+        while len(parts) > 1:
+            best = bi = -1
+            for i in range(len(parts) - 1):
+                a, b = parts[i], parts[i + 1]
+                if a.startswith("<0x") or b.startswith("<0x"):
+                    continue
+                r = vocab.get(a + b)
+                if r is not None and (best < 0 or r < best):
+                    best, bi = r, i
+            if bi < 0:
+                break
+            parts[bi:bi + 2] = [parts[bi] + parts[bi + 1]]
+        ids = [vocab.get(p, self.unk) for p in parts][:length - 1] + [self.eos]
+        return ids + [self.pad] * (length - len(ids))
 
 
 # --------------------------------------------------------------------------- теги для людей

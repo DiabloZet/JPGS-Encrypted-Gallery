@@ -12,8 +12,7 @@ optdepends=('python-cryptography: чуть более быстрая расши�
             'python-nautilus: пункты в меню Nautilus'
             'ffmpeg: сжатие и конвертация картинок и видео'
             'python-onnxruntime: поиск по смыслу (локальный ИИ)'
-            'python-numpy: поиск по смыслу (локальный ИИ)'
-            'python-tokenizers: поиск по смыслу фразой (SigLIP2)')
+            'python-numpy: поиск по смыслу (локальный ИИ)')
 
 package() {
     local src="$startdir"

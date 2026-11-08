@@ -1729,7 +1729,7 @@ class JpgsWindow(Adw.ApplicationWindow):
                 else:
                     qvec = None
                     eng = self._ai_engine()
-                    if eng.can_search() and not A.missing_libs(("tokenizers",)):
+                    if eng.can_search():
                         qvec = eng.embed_text(text)
                     res, exact = A.rank(text, items, qvec)
                 out = ([k for k, _s in res], exact, len(items), total, None)

@@ -117,12 +117,27 @@ class AIModelTests(unittest.TestCase):
         self.assertEqual((ix.done, ix.total), (2, 2))
         items = [(p, C.JpgsFile(p, c).entry(0).ai) for p in paths]
         self.assertTrue(all(a and a.get("m") for _p, a in items))
-        if A.model_installed("siglip2") and importlib.util.find_spec("tokenizers"):
+        if A.model_installed("siglip2"):
             eng = A.Engine(2)
             res, _exact = A.rank("красный цвет", items, eng.embed_text("красный цвет"))
             self.assertEqual(res[0][0], paths[0])
             res, _exact = A.rank("синий цвет", items, eng.embed_text("синий цвет"))
             self.assertEqual(res[0][0], paths[1])
+
+
+    def test_own_tokenizer_matches_reference(self):
+        """Свой токенизатор Gemma даёт те же токены, что и библиотека tokenizers."""
+        from jpgs import ai as A
+        if not A.model_installed("siglip2") or importlib.util.find_spec("tokenizers") is None:
+            self.skipTest("нужны SigLIP2 и tokenizers для сравнения")
+        from tokenizers import Tokenizer
+        path = os.path.join(A.models_dir(), "siglip2", "tokenizer.json")
+        ref, own = Tokenizer.from_file(path), A.GemmaTokenizer(path)
+        for text in ("девушка на пляже в красном купальнике", "Two cats on a sofa", "ёжик 😀 日本 18+",
+                     "", "обнажённая девушка в чулках", "a" * 200):
+            t = text.lower()
+            self.assertEqual(own.encode(t, 64), (ref.encode(t).ids + [0] * 64)[:63] + [1]
+                             if len(ref.encode(t).ids) > 64 else ref.encode(t).ids, text)
 
 
 if __name__ == "__main__":

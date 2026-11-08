@@ -42,8 +42,8 @@ GTK 4 + libadwaita, нативно под Wayland, видео через libmpv 
 | WD-Tagger v3 | подробные теги аниме/артов, в т.ч. откровенные | 468 МБ |
 | NudeNet 3 | что обнажено на фотографиях | 12 МБ |
 
-Нужны библиотеки `onnxruntime`, `numpy`, `tokenizers` (Arch: `python-onnxruntime python-numpy
-python-tokenizers`). Можно поставить не все модели: например, только SigLIP2 и NudeNet для фото.
+Нужны библиотеки `onnxruntime` и `numpy` (Arch: `sudo pacman -S python-onnxruntime-cpu python-numpy`;
+версия `-cuda` тоже подойдёт, но программа считает на процессоре). Можно поставить не все модели: например, только SigLIP2 и NudeNet для фото.
 
 **Сжатие и конвертация (FFmpeg).** Правый клик → «Сжать / конвертировать…»: для видео — формат
 (MP4 H.264/H.265, WebM VP9/AV1, MKV, GIF), качество, разрешение, кадры в секунду, звук, обрезка;
