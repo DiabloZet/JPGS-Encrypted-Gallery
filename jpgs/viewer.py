@@ -449,6 +449,10 @@ class JpgsWindow(Adw.ApplicationWindow):
         self._update_actions()
         self.connect("close-request", self._on_close)
         self.connect("notify::fullscreened", self._on_fullscreen)
+        # пока фокус в поле ввода, одиночные горячие клавиши (f, t, n, пробел, Backspace…)
+        # не должны срабатывать — иначе буквы уходят в команды JPGS, а не в текст
+        self.connect("notify::focus-widget", self._focus_changed)
+        self.connect("notify::is-active", self._focus_changed)
 
     # ------------------------------------------------------------------ UI
 
@@ -1677,7 +1681,7 @@ class JpgsWindow(Adw.ApplicationWindow):
     def _search_mode_changed(self, bar, _p):
         if bar.get_search_mode():
             self._search_idle_status()
-            GLib.idle_add(lambda: self.search_entry.grab_focus() and False)
+            GLib.idle_add(lambda: self._keep_typing_focus() and False)
             from . import ai as A
             if not A.installed_models() and not A.missing_libs():
                 t = Adw.Toast(title="Для поиска нужны модели ИИ (скачиваются один раз)",
@@ -1760,7 +1764,29 @@ class JpgsWindow(Adw.ApplicationWindow):
             self._set_results(res)
         threading.Thread(target=job, daemon=True).start()
 
+    def _focus_changed(self, *_):
+        if self.is_active():
+            self.app.text_mode(_is_text_input(self.get_focus()))
+
+    def _typing(self) -> bool:
+        """Фокус в строке поиска — пользователь печатает запрос."""
+        f = self.get_focus()
+        return f is not None and self.search_bar.get_search_mode() and \
+            (f is self.search_entry or f.is_ancestor(self.search_bar))
+
+    def _keep_typing_focus(self):
+        """Вернуть фокус в строку поиска с курсором на прежнем месте, без выделения текста —
+        иначе следующая буква заменила бы весь запрос или ушла горячей клавишей JPGS."""
+        pos = self.search_entry.get_position()
+        delegate = self.search_entry.get_delegate()
+        if delegate is not None and hasattr(delegate, "grab_focus_without_selecting"):
+            delegate.grab_focus_without_selecting()
+        else:
+            self.search_entry.grab_focus()
+        self.search_entry.set_position(pos)
+
     def _set_results(self, res):
+        typing = self._typing()
         self._results = None if res is None else list(res)
         self._rebuild_strip()
         self._update_strip_visibility()
@@ -1768,6 +1794,8 @@ class JpgsWindow(Adw.ApplicationWindow):
             self.show(*self._results[0])
         else:
             self._sync_strip()
+        if typing and not self._typing():
+            self._keep_typing_focus()
 
     def _cur_ai_vec(self):
         """Вектор смысла текущей записи (для «Найти похожие») или None."""
@@ -2130,7 +2158,8 @@ class JpgsWindow(Adw.ApplicationWindow):
         self._update_actions()
         self._prefetch()
         self._show_nav()
-        self.video.area.grab_focus()
+        if not self._typing():  # не отбирать фокус у строки поиска, пока в неё печатают
+            self.video.area.grab_focus()
 
     def _video_error(self, msg):
         if not self._cur_is_video():
@@ -3180,8 +3209,27 @@ class JpgsApp(Adw.Application):
             "window.close": ["<Control>w"],
             "app.quit": ["<Control>q"],
         }
+        self._accels = accels
+        self._text_mode = False
         for a, keys in accels.items():
             self.set_accels_for_action(a, keys)
+
+    # сочетания, которые оставляем и во время набора текста: они не мешают редактированию
+    TEXT_MODE_KEEP = {"<Control>f", "<Control>o", "<Control>w", "<Control>q", "<Control>l"}
+
+    def text_mode(self, on: bool):
+        """Включить/выключить «режим набора текста»: без одиночных горячих клавиш.
+
+        Горячие клавиши приложения в GTK 4 срабатывают раньше поля ввода, поэтому в строке
+        поиска, заметке, пароле и т.п. буквы «f», «t», «n», пробел и Backspace иначе
+        уходили бы в команды (полный экран, лента, заметка, пауза, предыдущий кадр).
+        """
+        if on == self._text_mode:
+            return
+        self._text_mode = on
+        for a, keys in self._accels.items():
+            self.set_accels_for_action(a, [k for k in keys if k in self.TEXT_MODE_KEEP]
+                                       if on else keys)
 
     def do_activate(self):
         win = self.get_active_window() or JpgsWindow(self)
@@ -3291,6 +3339,11 @@ def _dispose_originals(paths: list[str]) -> int:
         except (OSError, GLib.Error):
             pass
     return n
+
+
+def _is_text_input(w) -> bool:
+    """Фокус в поле ввода (строка, многострочный текст, поле пароля)."""
+    return isinstance(w, (Gtk.Text, Gtk.TextView, Gtk.Editable)) and w.get_sensitive()
 
 
 def human_size(n: int) -> str:
